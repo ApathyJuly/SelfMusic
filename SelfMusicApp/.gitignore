@@ -1,0 +1,22 @@
+# Local credentials and machine-specific configuration
+local.properties
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+
+# Build and IDE output
+.gradle/
+.gradle-user/
+.kotlin/
+build/
+app/build/
+.idea/
+*.iml
+
+# Local Android SDK/emulator state
+.android/
+.android-home/
+.android-avd/
+.android-sdk/

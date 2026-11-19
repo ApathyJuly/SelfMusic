@@ -1,0 +1,27 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:selfmusic-test;MODE=MySQL;DB_CLOSE_DELAY=-1;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+app:
+  jwt:
+    secret: test-jwt-secret-0123456789abcdef0123456789abcdef
+    access-token-ttl: PT30M
+    refresh-token-ttl: P30D
+  media:
+    token-secret: test-media-secret-0123456789abcdef0123456789abcdef
+    token-ttl: PT6H
+    cover-token-ttl: P7D
+  storage:
+    type: local
+    local:
+      root: ./target/test-storage
+  cors:
+    allowed-origins: "*"

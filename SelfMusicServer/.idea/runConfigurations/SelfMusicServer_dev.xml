@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="SelfMusicServer (dev)" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot">
+    <module name="selfmusic-server" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="com.selfmusic.server.SelfMusicServerApplication" />
+    <option name="ACTIVE_PROFILES" value="dev" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

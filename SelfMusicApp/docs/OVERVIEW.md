@@ -92,16 +92,18 @@ cd SelfMusicApp
 .\gradlew.bat :app:assembleDebug
 ```
 
-安装后打开 **设置 → 服务器账号**，填写：
+安装后打开 **设置 → 服务器账号**。服务器地址不需要手填：
+
+- `debug` 构建使用 `gradle.properties` 的 `selfmusic.serverBaseUrl.debug`
+- `release` 构建使用 `selfmusic.serverBaseUrl.release`
 
 ```text
-服务器地址：http://<服务器IP>:8080
-用户名 / 密码：注册或登录
+用户名 / 密码：登录，或切换到“注册”创建账号
 ```
 
 登录后即可在 **云端音乐** 中创建歌单、上传歌曲、播放和下载。
 
-> 局域网可以使用 HTTP；公网部署建议用 Nginx/Caddy 配置 HTTPS，并在 App 中填写 `https://` 地址。Android 已允许明文 HTTP 以支持自托管局域网。
+> 生产环境使用 HTTPS；本地开发如果没有 HTTPS 反向代理，请把 debug 地址改为 `http://...`。Android 已允许明文 HTTP 以支持局域网自托管。
 
 ## 安全说明
 

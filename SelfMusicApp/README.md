@@ -26,44 +26,52 @@ SelfMusicApp/app/build/outputs/apk/debug/app-debug.apk
 
 ## 后端地址配置
 
-默认地址统一放在 `gradle.properties`：
+后端地址固定写在 `gradle.properties`，App 界面不再填写服务器地址：
 
 ```properties
-selfmusic.serverBaseUrl=http://10.0.2.2:8080
+# release 构建：生产后端
+selfmusic.serverBaseUrl.release=https://miwifi-ra80v2-srv.taild2defd.ts.net/SelfMUsicServer
+
+# debug 构建：本地开发后端
+selfmusic.serverBaseUrl.debug=https://127.0.0.1:8080
 ```
 
-- **模拟器**：`http://10.0.2.2:8080`（`10.0.2.2` 映射到宿主机 `localhost`）
-- **真机同局域网**：改成 `http://<电脑局域网IP>:8080`
-- **临时覆盖构建默认值**：
+构建时会按 buildType 写入 `BuildConfig.DEFAULT_SERVER_BASE_URL`：
+
+| 构建类型 | 使用地址 |
+|---|---|
+| `debug` | `selfmusic.serverBaseUrl.debug` |
+| `release` | `selfmusic.serverBaseUrl.release` |
+
+临时覆盖：
 
 ```powershell
-.\gradlew.bat :app:assembleDebug -Pselfmusic.serverBaseUrl=http://192.168.1.20:8080
+# 本地调试
+.\gradlew.bat :app:assembleDebug -Pselfmusic.serverBaseUrl.debug=http://10.0.2.2:8080
+
+# 生产包
+.\gradlew.bat :app:assembleRelease -Pselfmusic.serverBaseUrl.release=https://your-domain/SelfMUsicServer
 ```
 
-修改后重新构建即可；该值会被写入 `BuildConfig.DEFAULT_SERVER_BASE_URL`。
+本地开发注意：
 
-运行时仍可在 App 内覆盖并保存到加密会话，优先级为：
-
-```text
-已保存的服务器会话  >  gradle.properties 的默认地址
-```
-
-如果 App 已经登录过旧地址，需要退出登录或在设置页直接修改地址。
+- Android 模拟器里的 `127.0.0.1` 是模拟器自己，不是电脑。要访问电脑本地 8080：
+  - 用 `adb reverse tcp:8080 tcp:8080`，然后 `https://127.0.0.1:8080` 才指向电脑；
+  - 或把 `selfmusic.serverBaseUrl.debug` 改成 `http://10.0.2.2:8080`。
+- 本地 Spring Boot 默认是 **HTTP**，不是 HTTPS；如果本地没有 HTTPS 反向代理，请把 debug 地址改成 `http://...`，否则会 SSL 握手失败。
 
 ## 连接后端
 
-打开 **设置 → 服务器账号**：
+App 启动时会先显示登录门禁，**未登录无法进入音乐库**。服务器地址会自动使用上面的配置：
 
 ```text
-服务器地址：http://<服务器IP>:8080
-用户名 / 密码：注册或登录
+登录：输入用户名 / 密码
+注册：切换到“注册”，填写用户名、密码、确认密码和显示名称
 ```
 
-登录后即可在 **云端音乐** 中创建歌单、上传歌曲、播放和下载。
+注册成功后会自动登录。用户名规则：3-32 位字母、数字或下划线；密码 8-72 位。
 
-- 模拟器访问宿主机后端：`http://10.0.2.2:8080`
-- 真机访问局域网后端：`http://<电脑局域网IP>:8080`
-- 公网部署建议使用 HTTPS
+登录后即可在 **云端音乐** 中创建歌单、上传歌曲、播放和下载。
 
 ## 工程结构
 

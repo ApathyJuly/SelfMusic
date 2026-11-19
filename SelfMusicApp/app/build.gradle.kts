@@ -5,15 +5,25 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
-val defaultServerBaseUrl = providers.gradleProperty("selfmusic.serverBaseUrl")
-    .orElse("http://10.0.2.2:8080")
+val debugServerBaseUrl = providers.gradleProperty("selfmusic.serverBaseUrl.debug")
+    .orElse("https://127.0.0.1:8080")
     .get()
-val escapedServerBaseUrl = defaultServerBaseUrl.replace("\\", "\\\\").replace("\"", "\\\"")
+val releaseServerBaseUrl = providers.gradleProperty("selfmusic.serverBaseUrl.release")
+    .orElse("https://miwifi-ra80v2-srv.taild2defd.ts.net/SelfMUsicServer")
+    .get()
+fun String.asBuildConfigValue() = "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 android { namespace = "com.selfmusic"; compileSdk = 35; buildToolsVersion = "35.0.0"
     defaultConfig {
         applicationId = "com.selfmusic"; minSdk = 26; targetSdk = 35; versionCode = 1; versionName = "0.1.0"
-        buildConfigField("String", "DEFAULT_SERVER_BASE_URL", "\"$escapedServerBaseUrl\"")
+    }
+    buildTypes {
+        debug {
+            buildConfigField("String", "DEFAULT_SERVER_BASE_URL", debugServerBaseUrl.asBuildConfigValue())
+        }
+        release {
+            buildConfigField("String", "DEFAULT_SERVER_BASE_URL", releaseServerBaseUrl.asBuildConfigValue())
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

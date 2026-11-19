@@ -216,7 +216,9 @@ Bucket 建议保持私有读写。后端会通过 S3 SDK 读写对象，Android 
 
 ## 生产建议
 
-- 使用 Nginx/Caddy 反向代理并启用 HTTPS；Android 端服务器地址填 `https://...`。
+> 从零开始的新手部署流程（Docker 安装、Nginx、HTTPS、备份、排错）见 **[DEPLOY.md](DEPLOY.md)**。
+
+- 使用 Nginx/Caddy 反向代理并启用 HTTPS；Android 端地址由 `gradle.properties` 的 `selfmusic.serverBaseUrl.release` 配置。
 - 将 MySQL 数据目录和 MinIO 数据目录纳入备份。
 - 限制服务器防火墙，只暴露 443/80；9000/9001 仅内网访问。
 - 定期轮换 `JWT_SECRET` 会使用户重新登录；`MEDIA_TOKEN_SECRET` 轮换会使旧播放链接失效，影响较小。

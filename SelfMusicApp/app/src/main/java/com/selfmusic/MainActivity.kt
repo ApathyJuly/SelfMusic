@@ -81,11 +81,28 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(state: Bundle?) { super.onCreate(state); enableEdgeToEdge()
         val db = androidx.room.Room.databaseBuilder(applicationContext, AppDatabase::class.java, "selfmusic.db").addMigrations(AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4).fallbackToDestructiveMigration().build()
         val serverStore = ServerSessionStore(applicationContext)
+        // 服务器地址已固定在 gradle.properties；旧地址的会话自动失效
+        val savedSession = serverStore.session.value
+        if (savedSession != null &&
+            !savedSession.baseUrl.trimEnd('/').equals(AppConfig.defaultServerBaseUrl.trimEnd('/'), ignoreCase = true)
+        ) {
+            serverStore.clear()
+        }
         val serverApi = ServerApi(applicationContext, serverStore)
         vm = ViewModelProvider(this, MusicViewModel.Factory(SongRepository(db.songDao(), MediaStoreScanner(contentResolver)), MusicSettings(applicationContext), serverStore, serverApi, applicationContext))[MusicViewModel::class.java]
-        setContent { GoldTheme { MusicApp(vm) } }
-        val needs = buildList { if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.READ_MEDIA_AUDIO) else add(Manifest.permission.READ_EXTERNAL_STORAGE); if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS) }
-        if (needs.any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }) permissions.launch(needs.toTypedArray()) else vm.scan()
+        setContent { GoldTheme { MusicApp(vm, ::ensureLibraryAccess) } }
+    }
+
+    private fun ensureLibraryAccess() {
+        val needs = buildList {
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.READ_MEDIA_AUDIO) else add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (needs.any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }) {
+            permissions.launch(needs.toTypedArray())
+        } else {
+            vm.scan()
+        }
     }
 }
 
@@ -176,10 +193,10 @@ class MusicViewModel(
     fun setFadeEnabled(enabled: Boolean) = viewModelScope.launch { settings.setFadeEnabled(enabled) }
     fun setFadeDurationMs(duration: Int) = viewModelScope.launch { settings.setFadeDurationMs(duration) }
 
-    fun login(baseUrl: String, username: String, password: String) = viewModelScope.launch {
+    fun login(username: String, password: String) = viewModelScope.launch {
         _authBusy.value = true
         _authMessage.value = null
-        runCatching { serverApi.login(baseUrl, username, password) }
+        runCatching { serverApi.login(AppConfig.defaultServerBaseUrl, username, password) }
             .onSuccess {
                 _authMessage.value = "登录成功"
                 refreshCloud()
@@ -188,16 +205,20 @@ class MusicViewModel(
         _authBusy.value = false
     }
 
-    fun register(baseUrl: String, username: String, password: String, displayName: String) = viewModelScope.launch {
+    fun register(username: String, password: String, displayName: String) = viewModelScope.launch {
         _authBusy.value = true
         _authMessage.value = null
-        runCatching { serverApi.register(baseUrl, username, password, displayName) }
+        runCatching { serverApi.register(AppConfig.defaultServerBaseUrl, username, password, displayName) }
             .onSuccess {
                 _authMessage.value = "注册并登录成功"
                 refreshCloud()
             }
             .onFailure { _authMessage.value = it.message ?: "注册失败" }
         _authBusy.value = false
+    }
+
+    fun clearAuthMessage() {
+        _authMessage.value = null
     }
 
     fun logout() = viewModelScope.launch {
@@ -561,8 +582,21 @@ class MusicViewModel(
     }
 }
 
-@Composable private fun MusicApp(vm: MusicViewModel) {
+@Composable private fun MusicApp(vm: MusicViewModel, requestLibraryAccess: () -> Unit) {
     val songs by vm.songs.collectAsStateWithLifecycle(); val search by vm.search.collectAsStateWithLifecycle(); val item by vm.current.collectAsStateWithLifecycle(); val playing by vm.playing.collectAsStateWithLifecycle(); val activeQueue by vm.activeQueue.collectAsStateWithLifecycle(); val path by vm.scanPath.collectAsStateWithLifecycle(); val boost by vm.loudnessBoost.collectAsStateWithLifecycle(); val fadeEnabled by vm.fadeEnabled.collectAsStateWithLifecycle(); val fadeDuration by vm.fadeDurationMs.collectAsStateWithLifecycle(); val position by vm.position.collectAsStateWithLifecycle(); val duration by vm.duration.collectAsStateWithLifecycle(); val serverSession by vm.serverSession.collectAsStateWithLifecycle(); val authMessage by vm.authMessage.collectAsStateWithLifecycle(); val authBusy by vm.authBusy.collectAsStateWithLifecycle(); val cloudMessage by vm.cloudMessage.collectAsStateWithLifecycle(); val cloudBusy by vm.cloudBusy.collectAsStateWithLifecycle()
+    if (serverSession == null) {
+        ServerSettingsPage(
+            current = null,
+            message = authMessage,
+            busy = authBusy,
+            vm = vm,
+            mod = Modifier.fillMaxSize(),
+            back = {},
+            gate = true
+        )
+        return
+    }
+    LaunchedEffect(Unit) { requestLibraryAccess() }
     val now = activeQueue.firstOrNull { it.id.toString() == item?.mediaId } ?: songs.firstOrNull { it.id.toString() == item?.mediaId }; var tab by rememberSaveable { mutableIntStateOf(0) }; var player by rememberSaveable { mutableStateOf(false) }; var add by rememberSaveable { mutableStateOf(false) }; var queueOpen by rememberSaveable { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
         if (player && now != null) PlayerPage(now!!, activeQueue.ifEmpty { songs }, playing, vm) { player = false } else Scaffold(
@@ -938,7 +972,7 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
     cloudMessage: String?, cloudBusy: Boolean, mod: Modifier, addSong: () -> Unit
 ) {
     var page by rememberSaveable { mutableStateOf("main") }
-    if (page == "server") { ServerSettingsPage(session, authMessage, authBusy, vm, mod) { page = "main" }; return }
+    if (page == "server") { ServerSettingsPage(session, authMessage, authBusy, vm, mod, back = { page = "main" }); return }
     if (page == "playback") { PlaybackSettingsPage(loudnessBoost, fadeEnabled, fadeDuration, vm, mod) { page = "main" }; return }
     if (page == "local") { LocalMusicSettingsPage(path, vm, mod) { page = "main" }; return }
     Column(mod.fillMaxSize().padding(24.dp)) {
@@ -966,35 +1000,109 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
 }
 
 @Composable private fun ServerSettingsPage(
-    current: ServerSession?, message: String?, busy: Boolean, vm: MusicViewModel, mod: Modifier, back: () -> Unit
+    current: ServerSession?, message: String?, busy: Boolean, vm: MusicViewModel, mod: Modifier,
+    back: () -> Unit, gate: Boolean = false
 ) {
-    // 默认值来自 gradle.properties 的 selfmusic.serverBaseUrl；已登录会话优先
-    var baseUrl by remember(current) { mutableStateOf(current?.baseUrl ?: AppConfig.defaultServerBaseUrl) }
     var username by remember(current) { mutableStateOf(current?.username.orEmpty()) }
     var password by remember { mutableStateOf("") }
+    var confirmPassword by remember { mutableStateOf("") }
     var displayName by remember { mutableStateOf("") }
+    var registerMode by rememberSaveable { mutableStateOf(false) }
     Column(mod.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(back) { Icon(Icons.Default.ArrowBack, "返回") }; Text("服务器账号", style = MaterialTheme.typography.headlineSmall) }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (!gate) IconButton(back) { Icon(Icons.Default.ArrowBack, "返回") }
+            Text(if (gate) "登录 SelfMusic" else "服务器账号", style = MaterialTheme.typography.headlineSmall)
+        }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 8.dp)) {
-            Text("登录后，云端音乐、歌单和上传都会保存到你的自建服务器。", style = MaterialTheme.typography.bodyMedium)
-            OutlinedTextField(baseUrl, { baseUrl = it }, Modifier.fillMaxWidth().padding(top = 12.dp), label = { Text("服务器地址") }, placeholder = { Text(AppConfig.defaultServerBaseUrl) }, singleLine = true)
+            Text(
+                if (registerMode) "创建一个新账号，注册成功后会自动登录。" else "登录已有账号，云端音乐、歌单和上传都会保存到服务器。",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            TabRow(
+                selectedTabIndex = if (registerMode) 1 else 0,
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+            ) {
+                Tab(
+                    selected = !registerMode,
+                    onClick = { registerMode = false; password = ""; confirmPassword = ""; vm.clearAuthMessage() },
+                    text = { Text("登录") }
+                )
+                Tab(
+                    selected = registerMode,
+                    onClick = { registerMode = true; password = ""; confirmPassword = ""; vm.clearAuthMessage() },
+                    text = { Text("注册") }
+                )
+            }
+            Text(
+                "服务器：${AppConfig.defaultServerBaseUrl}",
+                Modifier.padding(top = 12.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             OutlinedTextField(username, { username = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("用户名") }, singleLine = true)
+            if (username.isNotBlank() && !username.matches(Regex("[A-Za-z0-9_]{3,32}"))) {
+                Text("用户名需为 3-32 位字母、数字或下划线", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
             OutlinedTextField(password, { password = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("密码") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
-            OutlinedTextField(displayName, { displayName = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("显示名称（注册时可选）") }, singleLine = true)
+            if (registerMode) {
+                OutlinedTextField(confirmPassword, { confirmPassword = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("确认密码") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                OutlinedTextField(displayName, { displayName = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("显示名称（可选）") }, singleLine = true)
+                Text(
+                    "用户名 3-32 位，只能包含字母、数字或下划线；密码 8-72 位。",
+                    Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (password.isNotBlank() && password.length < 8) {
+                    Text("密码至少需要 8 位", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+                if (password.length > 72) {
+                    Text("密码最多 72 位", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+                if (confirmPassword.isNotBlank() && password != confirmPassword) {
+                    Text("两次输入的密码不一致", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            } else {
+                Text(
+                    "还没有账号？切换到“注册”创建。",
+                    Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
             message?.let {
                 Text(
                     it,
                     Modifier.padding(top = 12.dp),
                     color = when {
                         it.contains("成功") -> MaterialTheme.colorScheme.primary
-                        it.contains("失败") || it.contains("错误") || it.contains("过期") -> MaterialTheme.colorScheme.error
+                        it.contains("失败") || it.contains("错误") || it.contains("过期") || it.contains("不一致") -> MaterialTheme.colorScheme.error
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     }
                 )
             }
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 8.dp))
-            Button({ vm.login(baseUrl, username, password) }, Modifier.fillMaxWidth().padding(top = 16.dp), enabled = !busy && baseUrl.isNotBlank() && username.isNotBlank() && password.isNotBlank()) { Icon(Icons.Default.Login, null); Spacer(Modifier.width(8.dp)); Text("登录") }
-            OutlinedButton({ vm.register(baseUrl, username, password, displayName) }, Modifier.fillMaxWidth().padding(top = 8.dp), enabled = !busy && baseUrl.isNotBlank() && username.isNotBlank() && password.isNotBlank()) { Icon(Icons.Default.PersonAdd, null); Spacer(Modifier.width(8.dp)); Text("注册新账号") }
+            val usernameValid = username.matches(Regex("[A-Za-z0-9_]{3,32}"))
+            val canSubmit = !busy && username.isNotBlank() && usernameValid && password.isNotBlank() &&
+                (!registerMode || (password.length in 8..72 && password == confirmPassword))
+            Button(
+                onClick = {
+                    if (registerMode) vm.register(username, password, displayName)
+                    else vm.login(username, password)
+                },
+                Modifier.fillMaxWidth().padding(top = 16.dp),
+                enabled = canSubmit
+            ) {
+                Icon(if (registerMode) Icons.Default.PersonAdd else Icons.Default.Login, null)
+                Spacer(Modifier.width(8.dp))
+                Text(if (registerMode) "注册并登录" else "登录")
+            }
+            if (!registerMode) {
+                TextButton(
+                    onClick = { registerMode = true; password = ""; confirmPassword = ""; vm.clearAuthMessage() },
+                    modifier = Modifier.align(Alignment.End)
+                ) { Text("没有账号？立即注册") }
+            }
             if (current != null) {
                 HorizontalDivider(Modifier.padding(vertical = 16.dp))
                 Text("当前账号：${current.displayName.ifBlank { current.username }}（@${current.username}）", style = MaterialTheme.typography.bodyMedium)

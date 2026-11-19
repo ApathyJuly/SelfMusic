@@ -205,7 +205,7 @@ sequenceDiagram
     participant DB as MySQL
     participant OSS as S3 / MinIO
 
-    U->>UI: 输入服务器地址、用户名、密码
+    U->>UI: 输入用户名、密码（服务器地址由 buildType 配置自动决定）
     UI->>VM: login(...)
     VM->>API: POST /api/v1/auth/login
     API->>S: HTTPS JSON

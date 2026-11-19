@@ -20,3 +20,10 @@ app/build/
 .android-home/
 .android-avd/
 .android-sdk/
+
+# Packaged artifacts (do not commit build outputs)
+app/release/
+*.apk
+*.aab
+*.ap_
+*.dm

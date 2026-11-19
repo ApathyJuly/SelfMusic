@@ -1,10 +1,13 @@
 package com.selfmusic
 
 import android.Manifest
+import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -14,7 +17,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -31,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -38,15 +44,18 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -90,7 +99,10 @@ class MainActivity : ComponentActivity() {
         }
         val serverApi = ServerApi(applicationContext, serverStore)
         vm = ViewModelProvider(this, MusicViewModel.Factory(SongRepository(db.songDao(), MediaStoreScanner(contentResolver)), MusicSettings(applicationContext), serverStore, serverApi, applicationContext))[MusicViewModel::class.java]
-        setContent { GoldTheme { MusicApp(vm, ::ensureLibraryAccess) } }
+        setContent {
+            val themeKey by vm.themeColor.collectAsStateWithLifecycle()
+            GoldTheme(themeKey) { MusicApp(vm, ::ensureLibraryAccess) }
+        }
     }
 
     private fun ensureLibraryAccess() {
@@ -193,12 +205,17 @@ class MusicViewModel(
     fun setFadeEnabled(enabled: Boolean) = viewModelScope.launch { settings.setFadeEnabled(enabled) }
     fun setFadeDurationMs(duration: Int) = viewModelScope.launch { settings.setFadeDurationMs(duration) }
 
+    val themeColor: StateFlow<String> = settings.themeColor.stateIn(viewModelScope, SharingStarted.Eagerly, "gold")
+    fun setThemeColor(key: String) = viewModelScope.launch { settings.setThemeColor(key) }
+
     fun login(username: String, password: String) = viewModelScope.launch {
         _authBusy.value = true
         _authMessage.value = null
         runCatching { serverApi.login(AppConfig.defaultServerBaseUrl, username, password) }
             .onSuccess {
                 _authMessage.value = "登录成功"
+                _justLoggedIn.value = true
+                refreshAvatar()
                 refreshCloud()
             }
             .onFailure { _authMessage.value = it.message ?: "登录失败" }
@@ -211,6 +228,8 @@ class MusicViewModel(
         runCatching { serverApi.register(AppConfig.defaultServerBaseUrl, username, password, displayName) }
             .onSuccess {
                 _authMessage.value = "注册并登录成功"
+                _justLoggedIn.value = true
+                refreshAvatar()
                 refreshCloud()
             }
             .onFailure { _authMessage.value = it.message ?: "注册失败" }
@@ -230,7 +249,50 @@ class MusicViewModel(
         _selectedCloudDirectory.value = null
         _authMessage.value = "已退出服务器"
         _cloudMessage.value = null
+        _avatar.value = null
+        _profileMessage.value = null
         _authBusy.value = false
+    }
+
+    private val _avatar = MutableStateFlow<Bitmap?>(null); val avatar = _avatar.asStateFlow()
+    private val _profileBusy = MutableStateFlow(false); val profileBusy = _profileBusy.asStateFlow()
+    private val _profileMessage = MutableStateFlow<String?>(null); val profileMessage = _profileMessage.asStateFlow()
+    private val _justLoggedIn = MutableStateFlow(false); val justLoggedIn = _justLoggedIn.asStateFlow()
+
+    fun consumeJustLoggedIn() { _justLoggedIn.value = false }
+
+    fun clearProfileMessage() { _profileMessage.value = null }
+
+    /** 拉取服务端头像并解码；未设置头像时清空。 */
+    fun refreshAvatar() = viewModelScope.launch {
+        val bytes = runCatching { serverApi.fetchAvatar() }.getOrNull()
+        _avatar.value = bytes?.let { withContext(Dispatchers.Default) { BitmapFactory.decodeByteArray(it, 0, it.size) } }
+    }
+
+    fun uploadAvatar(uri: Uri) = viewModelScope.launch {
+        _profileBusy.value = true
+        _profileMessage.value = null
+        runCatching {
+            val bytes = withContext(Dispatchers.IO) { compressAvatar(context, uri) }
+            serverApi.uploadAvatar(bytes)
+            bytes
+        }.onSuccess { bytes ->
+            _avatar.value = withContext(Dispatchers.Default) { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) }
+            _profileMessage.value = "头像已更新"
+        }.onFailure { _profileMessage.value = it.message ?: "头像上传失败" }
+        _profileBusy.value = false
+    }
+
+    fun removeAvatar() = viewModelScope.launch {
+        _profileBusy.value = true
+        _profileMessage.value = null
+        runCatching { serverApi.deleteAvatar() }
+            .onSuccess {
+                _avatar.value = null
+                _profileMessage.value = "头像已移除"
+            }
+            .onFailure { _profileMessage.value = it.message ?: "移除头像失败" }
+        _profileBusy.value = false
     }
 
     fun createCloudDirectory(name: String, cover: Uri? = null) = viewModelScope.launch {
@@ -583,34 +645,61 @@ class MusicViewModel(
 }
 
 @Composable private fun MusicApp(vm: MusicViewModel, requestLibraryAccess: () -> Unit) {
-    val songs by vm.songs.collectAsStateWithLifecycle(); val search by vm.search.collectAsStateWithLifecycle(); val item by vm.current.collectAsStateWithLifecycle(); val playing by vm.playing.collectAsStateWithLifecycle(); val activeQueue by vm.activeQueue.collectAsStateWithLifecycle(); val path by vm.scanPath.collectAsStateWithLifecycle(); val boost by vm.loudnessBoost.collectAsStateWithLifecycle(); val fadeEnabled by vm.fadeEnabled.collectAsStateWithLifecycle(); val fadeDuration by vm.fadeDurationMs.collectAsStateWithLifecycle(); val position by vm.position.collectAsStateWithLifecycle(); val duration by vm.duration.collectAsStateWithLifecycle(); val serverSession by vm.serverSession.collectAsStateWithLifecycle(); val authMessage by vm.authMessage.collectAsStateWithLifecycle(); val authBusy by vm.authBusy.collectAsStateWithLifecycle(); val cloudMessage by vm.cloudMessage.collectAsStateWithLifecycle(); val cloudBusy by vm.cloudBusy.collectAsStateWithLifecycle()
+    val songs by vm.songs.collectAsStateWithLifecycle(); val search by vm.search.collectAsStateWithLifecycle(); val item by vm.current.collectAsStateWithLifecycle(); val playing by vm.playing.collectAsStateWithLifecycle(); val activeQueue by vm.activeQueue.collectAsStateWithLifecycle(); val path by vm.scanPath.collectAsStateWithLifecycle(); val boost by vm.loudnessBoost.collectAsStateWithLifecycle(); val fadeEnabled by vm.fadeEnabled.collectAsStateWithLifecycle(); val fadeDuration by vm.fadeDurationMs.collectAsStateWithLifecycle(); val position by vm.position.collectAsStateWithLifecycle(); val duration by vm.duration.collectAsStateWithLifecycle(); val serverSession by vm.serverSession.collectAsStateWithLifecycle(); val authMessage by vm.authMessage.collectAsStateWithLifecycle(); val authBusy by vm.authBusy.collectAsStateWithLifecycle(); val cloudMessage by vm.cloudMessage.collectAsStateWithLifecycle(); val cloudBusy by vm.cloudBusy.collectAsStateWithLifecycle(); val avatarBitmap by vm.avatar.collectAsStateWithLifecycle(); val profileBusy by vm.profileBusy.collectAsStateWithLifecycle(); val profileMessage by vm.profileMessage.collectAsStateWithLifecycle(); val justLoggedIn by vm.justLoggedIn.collectAsStateWithLifecycle(); val themeKey by vm.themeColor.collectAsStateWithLifecycle()
     if (serverSession == null) {
-        ServerSettingsPage(
-            current = null,
-            message = authMessage,
-            busy = authBusy,
-            vm = vm,
-            mod = Modifier.fillMaxSize(),
-            back = {},
-            gate = true
-        )
+        AuthGate(vm, authMessage, authBusy)
         return
     }
     LaunchedEffect(Unit) { requestLibraryAccess() }
-    val now = activeQueue.firstOrNull { it.id.toString() == item?.mediaId } ?: songs.firstOrNull { it.id.toString() == item?.mediaId }; var tab by rememberSaveable { mutableIntStateOf(0) }; var player by rememberSaveable { mutableStateOf(false) }; var add by rememberSaveable { mutableStateOf(false) }; var queueOpen by rememberSaveable { mutableStateOf(false) }
+    val now = activeQueue.firstOrNull { it.id.toString() == item?.mediaId } ?: songs.firstOrNull { it.id.toString() == item?.mediaId }; var tab by rememberSaveable { mutableIntStateOf(0) }; var player by rememberSaveable { mutableStateOf(false) }; var add by rememberSaveable { mutableStateOf(false) }; var queueOpen by rememberSaveable { mutableStateOf(false) }; var profileOpen by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(justLoggedIn) {
+        if (justLoggedIn) {
+            profileOpen = true
+            vm.consumeJustLoggedIn()
+            vm.refreshAvatar()
+        }
+    }
     Box(Modifier.fillMaxSize()) {
-        if (player && now != null) PlayerPage(now!!, activeQueue.ifEmpty { songs }, playing, vm) { player = false } else Scaffold(
-        bottomBar = { Column { if (tab != 3) PlayerControls(item, playing, position, duration, vm, { player = true }, { queueOpen = true }); NavigationBar { listOf("音乐库", "收藏", "云端音乐", "设置").forEachIndexed { i, name -> NavigationBarItem(selected = i == tab, onClick = { tab = i }, icon = { Icon(if (i == 0) Icons.Default.LibraryMusic else if (i == 1) Icons.Default.Favorite else if (i == 2) Icons.Default.Cloud else Icons.Default.Settings, null) }, label = { Text(name) }) } } } }
-    ) { pad -> when (tab) { 0 -> Library(songs.filter { it.sourceType != "CLOUD" }, search, vm, Modifier.padding(pad)); 1 -> Favorites(songs.filter { it.isFavorite }, vm, Modifier.padding(pad)); 2 -> CloudLibrary(songs.filter { it.sourceType == "CLOUD" }, cloudMessage, cloudBusy, vm, Modifier.padding(pad), { add = true }); else -> Settings(vm, path, boost, fadeEnabled, fadeDuration, serverSession, authMessage, authBusy, cloudMessage, cloudBusy, Modifier.padding(pad)) { add = true } } }
+        if (profileOpen && serverSession != null) ProfilePage(vm, serverSession!!, avatarBitmap, themeKey, profileBusy, profileMessage, Modifier.fillMaxSize()) { profileOpen = false } else if (player && now != null) PlayerPage(now!!, activeQueue.ifEmpty { songs }, playing, vm) { player = false } else Scaffold(
+        bottomBar = { Column { if (tab != 3) PlayerControls(item, playing, position, duration, vm, { player = true }, { queueOpen = true }); NavigationBar(containerColor = MaterialTheme.colorScheme.surface) { listOf("音乐库", "收藏", "云端音乐", "设置").forEachIndexed { i, name -> NavigationBarItem(selected = i == tab, onClick = { tab = i }, icon = { Icon(if (i == 0) Icons.Default.LibraryMusic else if (i == 1) Icons.Default.Favorite else if (i == 2) Icons.Default.Cloud else Icons.Default.Settings, null) }, label = { Text(name) }) } } } }
+    ) { pad -> when (tab) { 0 -> Library(songs.filter { it.sourceType != "CLOUD" }, search, vm, Modifier.padding(pad)); 1 -> Favorites(songs.filter { it.isFavorite }, vm, Modifier.padding(pad)); 2 -> CloudLibrary(songs.filter { it.sourceType == "CLOUD" }, cloudMessage, cloudBusy, vm, Modifier.padding(pad), { add = true }); else -> Settings(vm, path, boost, fadeEnabled, fadeDuration, serverSession, avatarBitmap, authMessage, authBusy, cloudMessage, cloudBusy, Modifier.padding(pad), { profileOpen = true }) } }
         if (add) AddSong(vm) { add = false }
         if (queueOpen) QueueSheet(activeQueue.ifEmpty { songs }, item?.mediaId, vm) { queueOpen = false }
     }
 }
 
+@Composable private fun AuthGate(vm: MusicViewModel, message: String?, busy: Boolean) {
+    val view = LocalView.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+    DisposableEffect(Unit) {
+        val activity = context as? Activity ?: (view.context as? Activity)
+        val controller = activity?.window?.let { WindowCompat.getInsetsController(it, view) }
+        val previousStatus = controller?.isAppearanceLightStatusBars
+        val previousNavigation = controller?.isAppearanceLightNavigationBars
+        controller?.isAppearanceLightStatusBars = true
+        controller?.isAppearanceLightNavigationBars = true
+        onDispose {
+            if (previousStatus != null) controller?.isAppearanceLightStatusBars = previousStatus
+            if (previousNavigation != null) controller?.isAppearanceLightNavigationBars = previousNavigation
+        }
+    }
+    Surface(Modifier.fillMaxSize(), color = Color.White) {
+            ServerSettingsPage(
+                current = null,
+                message = message,
+                busy = busy,
+                vm = vm,
+                mod = Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding(),
+                back = {},
+                gate = true
+            )
+        }
+}
+
 @Composable private fun Library(songs: List<SongEntity>, query: String, vm: MusicViewModel, mod: Modifier) = Column(mod.fillMaxSize()) {
     Text("本地音乐", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(20.dp, 18.dp, 20.dp, 8.dp)); OutlinedTextField(query, vm::search, Modifier.fillMaxWidth().padding(horizontal = 16.dp), singleLine = true, placeholder = { Text("搜索歌曲、歌手或专辑") }, leadingIcon = { Icon(Icons.Default.Search, null) })
     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Text("${songs.size} 首歌曲", Modifier.weight(1f)); TextButton(vm::scan) { Icon(Icons.Default.Refresh, null); Text("重新扫描") } }
-    if (songs.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("没有找到音乐文件\n请扫描或点击添加歌曲", textAlign = TextAlign.Center) } else LazyColumn(contentPadding = PaddingValues(bottom = 92.dp)) { items(songs, key = { it.id }) { SongRow(it, { vm.play(it, songs) }, { vm.favorite(it) }) } }
+    if (songs.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("没有找到音乐文件\n请在本地音乐配置中设置路径后重新扫描", textAlign = TextAlign.Center) } else LazyColumn(contentPadding = PaddingValues(bottom = 92.dp)) { items(songs, key = { it.id }) { SongRow(it, { vm.play(it, songs) }, { vm.favorite(it) }) } }
 }
 @Composable private fun Favorites(songs: List<SongEntity>, vm: MusicViewModel, mod: Modifier) = Column(mod.fillMaxSize()) { Text("收藏歌曲", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(20.dp)); if (songs.isEmpty()) Box(Modifier.fillMaxSize(), Alignment.Center) { Text("还没有收藏歌曲") } else LazyColumn { items(songs, key = { it.id }) { SongRow(it, { vm.play(it, songs) }, { vm.favorite(it) }) } } }
 @Composable private fun CloudLibrary(songs: List<SongEntity>, message: String?, busy: Boolean, vm: MusicViewModel, mod: Modifier, addSong: () -> Unit) {
@@ -625,7 +714,7 @@ class MusicViewModel(
         Column(mod.fillMaxSize()) {
             Text("云端音乐", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(20.dp))
             Box(Modifier.fillMaxSize(), Alignment.Center) {
-                Text("请先在“设置 → 服务器账号”登录自建服务器\n登录后即可同步歌单、上传和播放云端音乐", textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("请先在“设置 → 个人中心”登录自建服务器\n登录后即可同步歌单、上传和播放云端音乐", textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
         return
@@ -968,20 +1057,84 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
 @Composable private fun PickButton(name: String, icon: androidx.compose.ui.graphics.vector.ImageVector, pick: () -> Unit) = OutlinedButton(pick, Modifier.fillMaxWidth().padding(top = 6.dp)) { Icon(icon, null); Spacer(Modifier.width(8.dp)); Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis) }
 @Composable private fun Settings(
     vm: MusicViewModel, path: String?, loudnessBoost: Boolean, fadeEnabled: Boolean, fadeDuration: Int,
-    session: ServerSession?, authMessage: String?, authBusy: Boolean,
-    cloudMessage: String?, cloudBusy: Boolean, mod: Modifier, addSong: () -> Unit
+    session: ServerSession?, avatar: Bitmap?, authMessage: String?, authBusy: Boolean,
+    cloudMessage: String?, cloudBusy: Boolean, mod: Modifier, openProfile: () -> Unit
 ) {
     var page by rememberSaveable { mutableStateOf("main") }
     if (page == "server") { ServerSettingsPage(session, authMessage, authBusy, vm, mod, back = { page = "main" }); return }
     if (page == "playback") { PlaybackSettingsPage(loudnessBoost, fadeEnabled, fadeDuration, vm, mod) { page = "main" }; return }
     if (page == "local") { LocalMusicSettingsPage(path, vm, mod) { page = "main" }; return }
-    Column(mod.fillMaxSize().padding(24.dp)) {
-        Text("设置", style = MaterialTheme.typography.headlineMedium)
-        ListItem({ Text("添加歌曲") }, supportingContent = { Text(if (session == null) "导入到本地音乐库" else "上传歌曲、歌词与海报到自建服务器") }, trailingContent = { IconButton(addSong) { Icon(Icons.Default.AddCircle, "添加歌曲") } }, modifier = Modifier.clickable(onClick = addSong))
-        ListItem({ Text("服务器账号") }, supportingContent = { Text(if (session == null) "登录自建服务器，同步云端音乐" else "${session.baseUrl} · ${session.username}", maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(Icons.Default.Cloud, null) }, trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable { page = "server" })
-        ListItem({ Text("播放设置") }, supportingContent = { Text("音量平衡、渐入渐出及更多播放选项") }, leadingContent = { Icon(Icons.Default.Tune, null) }, trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable { page = "playback" })
-        ListItem({ Text("本地音乐配置") }, supportingContent = { Text(if (path == null) "系统音乐库、路径与扫描设置" else "已配置音乐路径") }, leadingContent = { Icon(Icons.Default.FolderOpen, null) }, trailingContent = { Icon(Icons.Default.ChevronRight, null) }, modifier = Modifier.clickable { page = "local" })
-        ListItem({ Text("播放缓存") }, supportingContent = { Text("云端音乐使用 5 GB LRU 磁盘缓存") })
+    Column(mod.fillMaxSize().background(MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+            Spacer(Modifier.height(10.dp))
+            SectionCard {
+                ListItem(
+                    headlineContent = { Text(session?.displayName?.ifBlank { session.username } ?: "未登录", style = MaterialTheme.typography.titleMedium) },
+                    supportingContent = { Text(if (session == null) "点击登录自建服务器" else "账号：${session.username}") },
+                    leadingContent = { AvatarThumb(session, avatar, 52) },
+                    trailingContent = { Icon(Icons.Default.ChevronRight, null) },
+                    modifier = Modifier.clickable(onClick = openProfile)
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            SectionCard {
+                Column {
+                    SettingsRow("播放设置", "音量平衡、渐入渐出及更多播放选项", Icons.Default.Tune) { page = "playback" }
+                    RowDivider()
+                    SettingsRow("本地音乐配置", if (path == null) "系统音乐库、路径与扫描设置" else "已配置音乐路径", Icons.Default.FolderOpen) { page = "local" }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            SectionCard {
+                ListItem(
+                    headlineContent = { Text("播放缓存") },
+                    supportingContent = { Text("云端音乐使用 5 GB LRU 磁盘缓存") },
+                    leadingContent = { Icon(Icons.Default.Storage, null) }
+                )
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+/** 微信风格的分组白色卡片。 */
+@Composable private fun SectionCard(content: @Composable ColumnScope.() -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.fillMaxWidth(), content = content)
+    }
+}
+
+@Composable private fun SettingsRow(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, onClick: () -> Unit) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = { Text(subtitle) },
+        leadingContent = { Icon(icon, null) },
+        trailingContent = { Icon(Icons.Default.ChevronRight, null) },
+        modifier = Modifier.clickable(onClick = onClick)
+    )
+}
+
+@Composable private fun RowDivider() {
+    HorizontalDivider(Modifier.padding(start = 56.dp), color = MaterialTheme.colorScheme.outlineVariant)
+}
+
+@Composable private fun AvatarThumb(session: ServerSession?, avatar: Bitmap?, size: Int) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+        modifier = Modifier.size(size.dp)
+    ) {
+        if (avatar != null) {
+            Image(avatar.asImageBitmap(), contentDescription = "头像", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        } else {
+            Box(Modifier.fillMaxSize(), Alignment.Center) {
+                Text(
+                    (session?.username?.take(1) ?: "?").uppercase(),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
     }
 }
 
@@ -1006,18 +1159,42 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
     var username by remember(current) { mutableStateOf(current?.username.orEmpty()) }
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var confirmPasswordVisible by remember { mutableStateOf(false) }
     var displayName by remember { mutableStateOf("") }
     var registerMode by rememberSaveable { mutableStateOf(false) }
     Column(mod.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (!gate) IconButton(back) { Icon(Icons.Default.ArrowBack, "返回") }
-            Text(if (gate) "登录 SelfMusic" else "服务器账号", style = MaterialTheme.typography.headlineSmall)
+        if (!gate) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(back) { Icon(Icons.Default.ArrowBack, "返回") }
+                Text("服务器账号", style = MaterialTheme.typography.headlineSmall)
+            }
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 8.dp)) {
-            Text(
-                if (registerMode) "创建一个新账号，注册成功后会自动登录。" else "登录已有账号，云端音乐、歌单和上传都会保存到服务器。",
-                style = MaterialTheme.typography.bodyMedium
-            )
+            if (gate) {
+                Icon(
+                    Icons.Default.LibraryMusic,
+                    contentDescription = null,
+                    modifier = Modifier.size(64.dp).align(Alignment.CenterHorizontally).padding(top = 24.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    "SelfMusic",
+                    style = MaterialTheme.typography.headlineLarge,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp)
+                )
+                Text(
+                    "登录后同步你的音乐库与云端歌单",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 4.dp, bottom = 8.dp)
+                )
+            } else {
+                Text(
+                    if (registerMode) "创建一个新账号，注册成功后会自动登录。" else "登录已有账号，云端音乐、歌单和上传都会保存到服务器。",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
             TabRow(
                 selectedTabIndex = if (registerMode) 1 else 0,
                 modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
@@ -1035,7 +1212,8 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
             }
             Text(
                 "服务器：${AppConfig.defaultServerBaseUrl}",
-                Modifier.padding(top = 12.dp),
+                Modifier.fillMaxWidth().padding(top = 12.dp),
+                textAlign = if (gate) TextAlign.Center else TextAlign.Start,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1043,9 +1221,23 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
             if (username.isNotBlank() && !username.matches(Regex("[A-Za-z0-9_]{3,32}"))) {
                 Text("用户名需为 3-32 位字母、数字或下划线", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
-            OutlinedTextField(password, { password = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("密码") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+            PasswordTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = "密码",
+                visible = passwordVisible,
+                onToggleVisibility = { passwordVisible = !passwordVisible },
+                modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
+            )
             if (registerMode) {
-                OutlinedTextField(confirmPassword, { confirmPassword = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("确认密码") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                PasswordTextField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it },
+                    label = "确认密码",
+                    visible = confirmPasswordVisible,
+                    onToggleVisibility = { confirmPasswordVisible = !confirmPasswordVisible },
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp)
+                )
                 OutlinedTextField(displayName, { displayName = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("显示名称（可选）") }, singleLine = true)
                 Text(
                     "用户名 3-32 位，只能包含字母、数字或下划线；密码 8-72 位。",
@@ -1062,13 +1254,6 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
                 if (confirmPassword.isNotBlank() && password != confirmPassword) {
                     Text("两次输入的密码不一致", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 }
-            } else {
-                Text(
-                    "还没有账号？切换到“注册”创建。",
-                    Modifier.padding(top = 8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
             message?.let {
                 Text(
@@ -1097,7 +1282,7 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
                 Spacer(Modifier.width(8.dp))
                 Text(if (registerMode) "注册并登录" else "登录")
             }
-            if (!registerMode) {
+            if (!registerMode && current == null) {
                 TextButton(
                     onClick = { registerMode = true; password = ""; confirmPassword = ""; vm.clearAuthMessage() },
                     modifier = Modifier.align(Alignment.End)
@@ -1109,14 +1294,204 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
                 Text(current.baseUrl, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(vm::logout, Modifier.fillMaxWidth().padding(top = 6.dp), enabled = !busy) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
             }
-            Text(
-                "Token 使用 Android Keystore 加密保存在本机。公网部署请使用 HTTPS；HTTP 仅建议在可信局域网使用。",
-                Modifier.padding(top = 16.dp, bottom = 24.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            if (!gate) {
+                Text(
+                    "Token 使用 Android Keystore 加密保存在本机。公网部署请使用 HTTPS；HTTP 仅建议在可信局域网使用。",
+                    Modifier.padding(top = 16.dp, bottom = 24.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
+}
+
+@Composable private fun ProfilePage(
+    vm: MusicViewModel, session: ServerSession, avatar: Bitmap?, themeKey: String, busy: Boolean, message: String?,
+    mod: Modifier, back: () -> Unit
+) {
+    var themePicker by remember { mutableStateOf(false) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.uploadAvatar(uri)
+    }
+    LaunchedEffect(session.userId, session.avatarObjectKey) { vm.refreshAvatar() }
+    val view = LocalView.current
+    val activity = androidx.compose.ui.platform.LocalContext.current as? Activity
+    DisposableEffect(Unit) {
+        val controller = activity?.window?.let { WindowCompat.getInsetsController(it, view) }
+        val previousStatus = controller?.isAppearanceLightStatusBars
+        val previousNavigation = controller?.isAppearanceLightNavigationBars
+        controller?.isAppearanceLightStatusBars = true
+        controller?.isAppearanceLightNavigationBars = true
+        onDispose {
+            if (previousStatus != null) controller?.isAppearanceLightStatusBars = previousStatus
+            if (previousNavigation != null) controller?.isAppearanceLightNavigationBars = previousNavigation
+        }
+    }
+    Surface(mod.fillMaxSize(), color = MaterialTheme.colorScheme.surfaceVariant) {
+            Column(Modifier.fillMaxSize()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
+                    Text("个人中心", style = MaterialTheme.typography.headlineSmall)
+                }
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    Spacer(Modifier.height(6.dp))
+                    SectionCard {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box {
+                                AvatarThumb(session, avatar, 72)
+                                Surface(
+                                    shape = CircleShape, color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.align(Alignment.BottomEnd).size(26.dp).clickable {
+                                        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                    }
+                                ) {
+                                    Box(Modifier.fillMaxSize(), Alignment.Center) {
+                                        Icon(Icons.Default.PhotoCamera, "更换头像", tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(14.dp))
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.width(16.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(session.displayName.ifBlank { session.username }, style = MaterialTheme.typography.titleLarge)
+                                Text("账号：${session.username}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    message?.let {
+                        Text(
+                            it, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 10.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (it.contains("失败")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    SectionCard {
+                        Column {
+                            SettingsRow("修改头像", "从相册选择，压缩后上传到服务器", Icons.Default.PhotoCamera) {
+                                picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            }
+                            if (session.hasAvatar) {
+                                RowDivider()
+                                SettingsRow("移除头像", "恢复为用户名首字母", Icons.Default.DeleteOutline) { vm.removeAvatar() }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    SectionCard {
+                        ListItem(
+                            headlineContent = { Text("主题颜色") },
+                            supportingContent = { Text(themeFor(themeKey).label) },
+                            leadingContent = { Icon(Icons.Default.Palette, null) },
+                            trailingContent = {
+                                Box(Modifier.size(22.dp).clip(CircleShape).background(themeFor(themeKey).primary))
+                            },
+                            modifier = Modifier.clickable { themePicker = true }
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    SectionCard {
+                        Column {
+                            InfoRow("服务器", session.baseUrl)
+                            RowDivider()
+                            InfoRow("账号", session.username)
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    SectionCard {
+                        Text(
+                            "退出登录",
+                            Modifier.fillMaxWidth().clickable(enabled = !busy, onClick = vm::logout).padding(vertical = 16.dp),
+                            textAlign = TextAlign.Center,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    Text(
+                        "头像保存在自建服务器，换设备登录会自动同步。Token 使用 Android Keystore 加密保存在本机。",
+                        Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(24.dp))
+                }
+            }
+        }
+    if (themePicker) {
+        AlertDialog(
+            onDismissRequest = { themePicker = false },
+            title = { Text("主题颜色") },
+            text = {
+                Column {
+                    appThemes.forEach { theme ->
+                        Row(
+                            Modifier.fillMaxWidth().clickable { vm.setThemeColor(theme.key); themePicker = false }.padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(Modifier.size(26.dp).clip(CircleShape).background(theme.primary))
+                            Spacer(Modifier.width(14.dp))
+                            Text(theme.label, Modifier.weight(1f))
+                            if (theme.key == themeKey) Icon(Icons.Default.Check, "已选", tint = theme.primary)
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton({ themePicker = false }) { Text("完成") } }
+        )
+    }
+}
+
+@Composable private fun InfoRow(title: String, value: String) {
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = { Text(value, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+    )
+}
+
+/** 相册图片先按长边 512 压缩成 JPEG，避免上传原图。 */
+private fun compressAvatar(context: Context, uri: Uri): ByteArray {
+    val resolver = context.contentResolver
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    var sample = 1
+    while (bounds.outWidth / sample > 1024 || bounds.outHeight / sample > 1024) sample *= 2
+    val bitmap = resolver.openInputStream(uri)?.use {
+        BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+    } ?: throw IllegalStateException("无法读取所选图片")
+    val ratio = 512f / maxOf(bitmap.width, bitmap.height).coerceAtLeast(1)
+    val scaled = if (ratio < 1f) {
+        Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt().coerceAtLeast(1), (bitmap.height * ratio).toInt().coerceAtLeast(1), true)
+    } else bitmap
+    val out = java.io.ByteArrayOutputStream()
+    scaled.compress(Bitmap.CompressFormat.JPEG, 88, out)
+    return out.toByteArray()
+}
+
+@Composable private fun PasswordTextField(
+    value: String, onValueChange: (String) -> Unit, label: String,
+    visible: Boolean, onToggleVisibility: () -> Unit, modifier: Modifier = Modifier
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        label = { Text(label) },
+        singleLine = true,
+        visualTransformation = if (visible) {
+            androidx.compose.ui.text.input.VisualTransformation.None
+        } else {
+            androidx.compose.ui.text.input.PasswordVisualTransformation()
+        },
+        trailingIcon = {
+            IconButton(onClick = onToggleVisibility) {
+                Icon(
+                    if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                    contentDescription = if (visible) "隐藏密码" else "显示密码"
+                )
+            }
+        }
+    )
 }
 
 @Composable private fun PlaybackSettingsPage(loudnessBoost: Boolean, fadeEnabled: Boolean, fadeDuration: Int, vm: MusicViewModel, mod: Modifier, back: () -> Unit) {
@@ -1134,4 +1509,36 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
 }
 private fun Context.fileName(uri: Uri): String = runCatching { contentResolver.query(uri, null, null, null, null)?.use { c -> c.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let { c.moveToFirst(); c.getString(it) } } }.getOrNull() ?: "已选择文件"
 private fun duration(ms: Long) = "%d:%02d".format(ms / 60000, (ms / 1000) % 60)
-@Composable private fun GoldTheme(content: @Composable () -> Unit) { val gold = Color(0xFFB88925); MaterialTheme(colorScheme = if (androidx.compose.foundation.isSystemInDarkTheme()) darkColorScheme(primary = Color(0xFFFFD670), secondary = Color(0xFFE9C56B), secondaryContainer = Color(0xFF5A4211), background = Color(0xFF171207), surface = Color(0xFF211A0C)) else lightColorScheme(primary = gold, secondary = Color(0xFF8B6919), secondaryContainer = Color(0xFFFFE9B0), background = Color(0xFFFFF9EE), surface = Color(0xFFFFF9EE)), content = content) }
+/** 可选主题色。primaryContainer 用于头像底、播放条等浅色块。 */
+data class AppTheme(val key: String, val label: String, val primary: Color, val primaryContainer: Color, val secondary: Color)
+
+private val appThemes = listOf(
+    AppTheme("gold", "鎏金", Color(0xFFB88925), Color(0xFFFFE9B0), Color(0xFF8B6919)),
+    AppTheme("blue", "海蓝", Color(0xFF2F6FD0), Color(0xFFD8E6FF), Color(0xFF4A80D9)),
+    AppTheme("green", "松绿", Color(0xFF2E8B57), Color(0xFFD3F0DF), Color(0xFF3D9E68)),
+    AppTheme("purple", "雅紫", Color(0xFF7A4FD0), Color(0xFFE9DDFF), Color(0xFF8B63DE)),
+    AppTheme("red", "绯红", Color(0xFFC0392B), Color(0xFFFFDAD3), Color(0xFFD05043)),
+    AppTheme("pink", "樱粉", Color(0xFFD4557F), Color(0xFFFFDDE7), Color(0xFFE07098))
+)
+
+private fun themeFor(key: String?): AppTheme = appThemes.firstOrNull { it.key == key } ?: appThemes.first()
+
+@Composable private fun GoldTheme(themeKey: String? = "gold", content: @Composable () -> Unit) {
+    val theme = themeFor(themeKey)
+    // 统一浅色外观（参考微信）：页面底色浅灰，内容块为白色卡片，主色由用户选择
+    MaterialTheme(
+        colorScheme = lightColorScheme(
+            primary = theme.primary,
+            onPrimary = Color.White,
+            primaryContainer = theme.primaryContainer,
+            onPrimaryContainer = Color(0xFF1B1B1B),
+            secondary = theme.secondary,
+            secondaryContainer = theme.primaryContainer,
+            background = Color(0xFFF2F2F2),
+            surface = Color.White,
+            surfaceVariant = Color(0xFFF2F2F2),
+            onSurfaceVariant = Color(0xFF666666)
+        ),
+        content = content
+    )
+}

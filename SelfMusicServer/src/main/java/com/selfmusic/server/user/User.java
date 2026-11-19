@@ -33,6 +33,9 @@ public class User {
     @Column(name = "display_name", nullable = false, length = 100)
     private String displayName;
 
+    @Column(name = "avatar_object_key", length = 512)
+    private String avatarObjectKey;
+
     @Column(name = "created_at", nullable = false)
     private Instant createdAt;
 

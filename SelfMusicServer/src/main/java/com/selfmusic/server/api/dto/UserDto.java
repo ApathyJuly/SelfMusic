@@ -6,6 +6,7 @@ public record UserDto(
         String id,
         String username,
         String displayName,
-        Instant createdAt
+        Instant createdAt,
+        String avatarObjectKey
 ) {
 }

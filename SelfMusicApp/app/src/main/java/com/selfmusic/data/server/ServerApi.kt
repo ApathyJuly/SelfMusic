@@ -85,6 +85,51 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
             }
         }
 
+    /** 上传头像；图片会先在本地压缩，服务端只接受 JPEG/PNG/WebP 且不超过 5 MB。 */
+    suspend fun uploadAvatar(image: ByteArray, contentType: String = "image/jpeg"): ServerSession =
+        withContext(Dispatchers.IO) {
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart(
+                    "file",
+                    "avatar.${if (contentType == "image/png") "png" else "jpg"}",
+                    image.toRequestBody(contentType.toMediaType())
+                )
+                .build()
+            requestWithAuth("/api/v1/users/me/avatar", "PUT", body).use { response ->
+                ensureSuccess(response)
+                val user = JSONObject(response.body?.string().orEmpty())
+                val latest = store.session.value ?: throw ServerAuthException("请先登录服务器")
+                val updated = latest.copy(
+                    displayName = user.optString("displayName", latest.displayName),
+                    avatarObjectKey = user.optString("avatarObjectKey").takeIf { it.isNotBlank() && it != "null" }
+                )
+                store.save(updated)
+                updated
+            }
+        }
+
+    /** 下载当前账号头像；未设置头像时返回 null。 */
+    suspend fun fetchAvatar(): ByteArray? = withContext(Dispatchers.IO) {
+        val session = store.session.value ?: return@withContext null
+        if (!session.hasAvatar) return@withContext null
+        requestWithAuth("/api/v1/users/me/avatar").use { response ->
+            if (response.code == 404) return@withContext null
+            ensureSuccess(response)
+            response.body?.bytes()
+        }
+    }
+
+    suspend fun deleteAvatar(): ServerSession? = withContext(Dispatchers.IO) {
+        val session = store.session.value ?: return@withContext null
+        requestWithAuth("/api/v1/users/me/avatar", "DELETE").use { response ->
+            if (response.code != 404) ensureSuccess(response)
+        }
+        val updated = session.copy(avatarObjectKey = null)
+        store.save(updated)
+        updated
+    }
+
     suspend fun logout() = withContext(Dispatchers.IO) {
         val session = store.session.value
         if (session != null) {
@@ -360,7 +405,8 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
             userId = user.getString("id"),
             username = user.getString("username"),
             displayName = user.optString("displayName", user.getString("username")),
-            accessExpiresAt = System.currentTimeMillis() + json.optLong("expiresIn", 1800) * 1000
+            accessExpiresAt = System.currentTimeMillis() + json.optLong("expiresIn", 1800) * 1000,
+            avatarObjectKey = user.optString("avatarObjectKey").takeIf { it.isNotBlank() && it != "null" }
         )
     }
 

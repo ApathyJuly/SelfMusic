@@ -82,7 +82,13 @@ public class AuthService {
     }
 
     public static UserDto toDto(User user) {
-        return new UserDto(user.getId(), user.getUsername(), user.getDisplayName(), user.getCreatedAt());
+        return new UserDto(
+                user.getId(),
+                user.getUsername(),
+                user.getDisplayName(),
+                user.getCreatedAt(),
+                user.getAvatarObjectKey()
+        );
     }
 
     private static String normalize(String username) {

@@ -32,6 +32,7 @@ class ServerSessionStore(context: Context) {
             put("userId", session.userId)
             put("username", session.username)
             put("displayName", session.displayName)
+            put("avatarObjectKey", session.avatarObjectKey ?: JSONObject.NULL)
             put("accessExpiresAt", session.accessExpiresAt)
         }
         val cipher = Cipher.getInstance(TRANSFORMATION).apply {
@@ -64,7 +65,8 @@ class ServerSessionStore(context: Context) {
             userId = json.optString("userId"),
             username = json.optString("username"),
             displayName = json.optString("displayName"),
-            accessExpiresAt = json.optLong("accessExpiresAt")
+            accessExpiresAt = json.optLong("accessExpiresAt"),
+            avatarObjectKey = json.optString("avatarObjectKey").takeIf { it.isNotBlank() && it != "null" }
         )
     }.getOrNull()
 

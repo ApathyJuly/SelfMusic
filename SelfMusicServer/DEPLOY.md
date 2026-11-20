@@ -8,6 +8,20 @@
 > 如果你的服务器是 **CentOS 7 / RHEL 7**，命令差异很大（yum 源已失效、Docker 版本锁死、SELinux、firewalld），
 > 请改用 [deploy/DEPLOY-centos7.md](deploy/DEPLOY-centos7.md)。
 
+### 系统怎么选（跑 Docker 的话）
+
+| 推荐度 | 系统 | 理由 |
+|---|---|---|
+| ★★★ **首选** | **Ubuntu Server 24.04 LTS** | Docker 官方一等公民，`get.docker.com` 直接可用；教程/驱动/硬件兼容最全；支持到 2029-06 |
+| ★★☆ 次选 | **Debian 12 (bookworm)** | 最小安装的内存占用最低，同样官方支持，稳定到出名；支持到 2028，LTS 可到 2032 |
+| ★☆☆ 习惯 yum | **Rocky / AlmaLinux 9** | 能继续用 `yum`，生命周期到 2032；但 SELinux、firewalld 要额外处理 |
+| ✗ 不要用 | CentOS 7 / 8、非 LTS 的 Ubuntu（24.10、25.04） | 前者已 EOL 无安全更新，后者只有 9 个月支持期 |
+
+三者都能跑本仓库的 compose 文件，镜像也都有 arm64 版本；**区别只在装系统级依赖那几条命令**。
+
+安装时选 **最小化安装 + OpenSSH server**，不要装图形界面（省 1GB 内存和一堆无关服务）。
+
+
 ---
 
 ## 第 0 步：先花 3 分钟搞懂 4 个词
@@ -136,6 +150,8 @@ MINIO_ROOT_USER=minioadmin
 MINIO_ROOT_PASSWORD=<20位以上随机密码>
 S3_BUCKET=selfmusic
 S3_REGION=us-east-1
+# 客户端访问 MinIO 的地址；和下面的域名一致，不要带 /selfmusic
+S3_PUBLIC_ENDPOINT=https://music.example.com
 
 # 只有 Android 客户端，保持 *
 CORS_ALLOWED_ORIGINS=*
@@ -268,7 +284,7 @@ ss -tlnp | grep -E '8080|9000|9001'
 # 应该只看到 127.0.0.1:8080 这种，不能是 0.0.0.0:8080
 ```
 
-> MinIO 控制台（9001）和 S3 接口（9000）都只需要内网访问，后端在容器网络里直连它们，**不要对公网开放**。
+> MinIO 控制台（9001）和 S3 接口（9000）都只需要内网访问，后端在容器网络里直连它们，**不要对公网开放**。App 的媒体流量走 Nginx 的 `/selfmusic/` 反向代理到 MinIO，不要把 9000 映射到公网。
 
 ---
 

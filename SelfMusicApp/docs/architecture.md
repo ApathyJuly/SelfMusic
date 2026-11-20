@@ -24,7 +24,7 @@ flowchart TB
         PREFS[("DataStore<br/>扫描路径 · 播放模式 · 响度 · 淡化")]
         SCAN["MediaStoreScanner"]
         MEDIA[("Android MediaStore<br/>设备音频")]
-        SERVER_API["ServerApi<br/>JWT 自动刷新 · multipart 上传<br/>歌单/歌曲/播放地址"]
+        SERVER_API["ServerApi<br/>JWT 自动刷新 · 音频预签名直传<br/>歌单/歌曲/批量播放地址"]
         SESSION["ServerSessionStore<br/>Keystore AES-GCM<br/>加密保存 Token"]
         PLAY["PlaybackService<br/>MediaSessionService + ExoPlayer<br/>LoudnessEnhancer"]
         CACHE[("PlaybackCache<br/>5 GB LRU")]
@@ -35,7 +35,7 @@ flowchart TB
         WEB["REST API /api/v1<br/>Auth · Playlists · Songs · Media"]
         AUTH["AuthService<br/>BCrypt · Access JWT<br/>Refresh Token 轮换"]
         MUSIC["MusicService<br/>歌单/歌曲/对象编排"]
-        STREAM["MediaController<br/>HMAC 短时 token<br/>HTTP Range 流式转发"]
+        STREAM["MediaUrlService<br/>预签名 URL<br/>本地存储 Range 回落"]
         STORAGE["StorageService<br/>S3 / Local 实现"]
         JPA["JPA Repositories + Flyway"]
     end
@@ -56,8 +56,8 @@ flowchart TB
     PLAY -->|音频数据源| CACHE
     PLAY -.->|本地 content://| MEDIA
 
-    SERVER_API <-->|HTTPS JSON / multipart| WEB
-    CACHE <-->|HTTP Range 播放| WEB
+    SERVER_API <-->|HTTPS JSON / 预签名| WEB
+    CACHE <-->|预签名 GET 直连 / Range| S3
 
     WEB --> AUTH
     WEB --> MUSIC
@@ -65,7 +65,7 @@ flowchart TB
     AUTH --> JPA
     MUSIC --> JPA
     MUSIC --> STORAGE
-    STREAM --> JPA
+    MUSIC --> STREAM
     STREAM --> STORAGE
     JPA <--> PG
     STORAGE <--> S3
@@ -85,16 +85,16 @@ Compose UI  →  MusicViewModel  →  SongRepository  →  Room / MediaStoreScan
                     │
                     ├─→ DataStore（普通偏好）
                     ├─→ ServerSessionStore（加密 Token）
-                    ├─→ ServerApi（登录 / 歌单 / 歌曲 / 播放地址）
+                    ├─→ ServerApi（登录 / 歌单 / 歌曲 / 批量播放地址）
                     └─→ MediaController（播放控制）
 
 ServerApi  →  Spring Boot REST API
                     ├─→ AuthService       →  users / refresh_tokens
-                    ├─→ MusicService      →  playlists / songs → StorageService
-                    └─→ MediaController   →  StorageService（Range 读取）
+                    ├─→ MusicService      →  playlists / songs
+                    └─→ MediaUrlService   →  预签名 URL（S3）或 Range（本地）
                                                    │
                                                    ├─→ MySQL（元数据）
-                                                   └─→ S3 / MinIO（音频、封面、歌词）
+                                                   └─→ Nginx → MinIO / S3（音频、封面、歌词）
 ```
 
 ## 2. 仓库结构
@@ -135,7 +135,7 @@ SelfMusic/
 └─ SelfMusicServer/                        # 自建后端（独立 Maven 项目）
    ├─ pom.xml
    ├─ Dockerfile
-   ├─ docker-compose.yml                   # Postgres + MinIO + Server
+   ├─ docker-compose.yml                   # MySQL + MinIO + Server
    ├─ .env.example
    ├─ README.md                            # 部署、环境变量、API
    ├─ src/
@@ -216,11 +216,15 @@ sequenceDiagram
 
     U->>UI: 选择歌单 + 音频/歌词/封面
     UI->>VM: importSong(...)
-    VM->>API: POST /api/v1/playlists/{id}/songs
-    API->>S: multipart + Bearer Token
-    S->>OSS: PutObject 音频/封面/歌词
+    VM->>API: POST /api/v1/playlists/{id}/songs/direct-upload
+    API->>S: Bearer Token + 文件元数据
+    S-->>API: songId + 预签名 PUT URL
+    API->>OSS: PUT 音频（直传，不经 Spring Boot）
+    API->>S: POST /songs/{id}/direct-upload/complete
+    S->>OSS: HEAD 校验对象
     S->>DB: INSERT song
     S-->>API: SongDto
+    API->>S: PUT /songs/{id}（可选封面/歌词）
     API-->>VM: SongEntity
     VM->>API: GET /playlists/{id}/songs
     VM-->>UI: 刷新列表
@@ -240,25 +244,24 @@ sequenceDiagram
     participant C as PlaybackCache
 
     U->>VM: 点击云端歌曲
-    VM->>API: GET /api/v1/songs/{id}/play-url
-    API->>S: Bearer Token
-    S-->>API: /api/v1/media/songs/{id}?token=...
-    API-->>VM: 绝对播放地址
-    VM->>P: MediaController.setMediaItems(url)
-    P->>S: GET Range: bytes=...
-    S->>OSS: GetObject(range)
-    OSS-->>S: 音频分片
-    S-->>P: 206 Partial Content
-    P->>C: 写入 5GB LRU 缓存
+    VM->>API: POST /api/v1/songs/play-urls（整个队列一次请求）
+    API->>S: Bearer Token + songIds
+    S-->>API: 每首歌的预签名 GET URL
+    API-->>VM: Map<songId, url>
+    VM->>P: MediaController.setMediaItems(urls)
+    P->>OSS: GET Range: bytes=...（直连 Nginx → MinIO）
+    OSS-->>P: 206 Partial Content
+    P->>C: 写入 5GB LRU 缓存（稳定 cache key）
     C-->>U: ExoPlayer 播放
 ```
 
-### 4.3 认证与媒体 token
+### 4.3 认证与媒体地址
 
 - Access Token：JWT，默认 30 分钟，放在 `Authorization: Bearer`。
 - Refresh Token：随机 32 字节，数据库存 SHA-256，默认 30 天；每次刷新轮换旧 token。
-- 媒体 URL：HMAC-SHA256 签名，包含 `songId / userId / kind / expires / download`，默认 6 小时；封面 7 天。
-- 媒体接口不需要 JWT Header，ExoPlayer 可直接使用 URL；后端校验 token 后再从 S3 读取。
+- S3/MinIO 模式：后端签发预签名 GET/PUT URL，默认 6 小时；App 直连 Nginx/MinIO，不再经过 Spring Boot。
+- 本地磁盘模式：回落到 HMAC token + 后端 Range 流式转发。
+- 媒体 URL 不需要 JWT Header，ExoPlayer 可直接使用；缓存 key 使用 `cloudId + objectVersion`，token 变化不会击穿缓存。
 - Android 会话：Keystore AES-GCM 加密后写入 SharedPreferences；应用关闭云备份。
 
 ## 5. 数据与对象布局
@@ -301,13 +304,13 @@ users/{userId}/
 
 ## 6. 关键设计点
 
-1. **一个后端入口**：Android 只访问 `ServerApi`，不接触 MySQL/S3 凭据；S3 可完全私有。
-2. **媒体代理而非预签名直传**：后端统一鉴权并处理 Range，避免 MinIO 内外网地址不一致、S3 CORS 和客户端持有长期对象存储密钥的问题。
+1. **控制面/数据面分离**：Android 的登录、歌单元数据只访问 `ServerApi`；音频字节通过后端签发的短时预签名 URL 直连 Nginx/MinIO，App 不持有对象存储密钥。
+2. **预签名直连 + 本地回落**：S3/MinIO 使用预签名 GET/PUT；本地磁盘开发环境回落到后端 Range 流式转发，两种模式对 UI 透明。
 3. **双 Token**：短期 Access JWT + 可撤销/轮换的 Refresh Token；Android 401 自动刷新并重试一次。
 4. **本地/云端统一模型**：`SongEntity` 用 `sourceType=CLOUD` 标记服务器歌曲；播放、收藏、歌词编辑复用同一套 UI。
 5. **缓存失效**：服务端每次编辑更新 `objectVersion`，Android 用 `server:{cloudId}:{version}` 作为 Media3 缓存 key。
-6. **多用户隔离**：所有歌单/歌曲查询都带 `userId` 条件；媒体 token 也绑定 `userId`，越权返回 404。
-7. **部署最小化**：Docker Compose 同时启动 MySQL、MinIO 和 Spring Boot；MinIO 初始化容器负责建 Bucket。
+6. **多用户隔离**：所有歌单/歌曲查询都带 `userId` 条件；本地媒体 token 绑定 `userId`，S3 模式的对象 Key 也包含用户目录，越权返回 404。
+7. **部署最小化**：Docker Compose 启动 MySQL、MinIO 和 Spring Boot；宿主机 Nginx 提供 API 与 `/selfmusic/` 媒体入口，MinIO 初始化容器负责建 Bucket。
 
 ## 7. 现状与后续建议
 

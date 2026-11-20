@@ -22,6 +22,7 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -62,6 +63,29 @@ class S3StorageServiceTest {
         assertThat(request.getValue().key()).isEqualTo("users/u/songs/s/audio.mp3");
         assertThat(request.getValue().contentType()).isEqualTo("audio/mpeg");
         assertThat(request.getValue().contentLength()).isEqualTo(content.length);
+    }
+
+    @Test
+    void presignedUrlsUsePublicEndpointAndPathStyle() {
+        AppProperties properties = new AppProperties();
+        properties.getStorage().getS3().setBucket("test-bucket");
+        properties.getStorage().getS3().setEndpoint("http://minio:9000");
+        properties.getStorage().getS3().setPublicEndpoint("https://media.example.com");
+        properties.getStorage().getS3().setRegion("us-east-1");
+        properties.getStorage().getS3().setAccessKey("test-access");
+        properties.getStorage().getS3().setSecretKey("test-secret");
+        properties.getStorage().getS3().setPathStyle(true);
+        S3StorageService presignedService = new S3StorageService(s3, properties);
+
+        String getUrl = presignedService.presignedGetUrl(
+                "users/u/songs/s/audio.mp3", Duration.ofMinutes(5), null, "audio/mpeg");
+        String putUrl = presignedService.presignedPutUrl(
+                "users/u/songs/s/audio.mp3", Duration.ofMinutes(5), "audio/mpeg");
+
+        assertThat(getUrl).startsWith("https://media.example.com/test-bucket/users/u/songs/s/audio.mp3");
+        assertThat(getUrl).contains("X-Amz-Signature");
+        assertThat(putUrl).startsWith("https://media.example.com/test-bucket/users/u/songs/s/audio.mp3");
+        assertThat(putUrl).contains("X-Amz-Signature");
     }
 
     @Test

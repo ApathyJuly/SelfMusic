@@ -3,12 +3,17 @@ package com.selfmusic.server.storage;
 import com.selfmusic.server.common.ApiException;
 import com.selfmusic.server.config.AppProperties;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.ResponseInputStream;
 import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.CreateBucketRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
@@ -19,8 +24,13 @@ import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.PresignedGetObjectRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
 
 import java.io.InputStream;
+import java.net.URI;
+import java.time.Duration;
 
 @Slf4j
 @Service
@@ -28,11 +38,40 @@ import java.io.InputStream;
 public class S3StorageService implements StorageService {
 
     private final S3Client s3;
+    private final S3Presigner presigner;
     private final AppProperties properties;
 
     public S3StorageService(S3Client s3, AppProperties properties) {
         this.s3 = s3;
         this.properties = properties;
+        this.presigner = createPresigner(properties);
+    }
+
+    @PreDestroy
+    void closePresigner() {
+        presigner.close();
+    }
+
+    private static S3Presigner createPresigner(AppProperties properties) {
+        AppProperties.S3 s3 = properties.getStorage().getS3();
+        var builder = S3Presigner.builder()
+                .region(Region.of(s3.getRegion()))
+                .serviceConfiguration(S3Configuration.builder()
+                        .pathStyleAccessEnabled(s3.isPathStyle())
+                        .build());
+        String endpoint = s3.getPublicEndpoint() == null || s3.getPublicEndpoint().isBlank()
+                ? s3.getEndpoint()
+                : s3.getPublicEndpoint();
+        if (endpoint != null && !endpoint.isBlank()) {
+            builder.endpointOverride(URI.create(endpoint));
+        }
+        if (s3.getAccessKey() != null && !s3.getAccessKey().isBlank()
+                && s3.getSecretKey() != null && !s3.getSecretKey().isBlank()) {
+            builder.credentialsProvider(StaticCredentialsProvider.create(
+                    AwsBasicCredentials.create(s3.getAccessKey(), s3.getSecretKey())
+            ));
+        }
+        return builder.build();
     }
 
     @PostConstruct
@@ -124,6 +163,41 @@ public class S3StorageService implements StorageService {
         } catch (S3Exception exception) {
             return false;
         }
+    }
+
+    @Override
+    public boolean supportsPresignedUrls() {
+        return true;
+    }
+
+    @Override
+    public String presignedGetUrl(String key, Duration ttl, String contentDisposition, String contentType) {
+        GetObjectRequest.Builder request = GetObjectRequest.builder()
+                .bucket(bucket())
+                .key(key);
+        if (contentDisposition != null && !contentDisposition.isBlank()) {
+            request.responseContentDisposition(contentDisposition);
+        }
+        if (contentType != null && !contentType.isBlank()) {
+            request.responseContentType(contentType);
+        }
+        PresignedGetObjectRequest presigned = presigner.presignGetObject(builder -> builder
+                .signatureDuration(ttl)
+                .getObjectRequest(request.build()));
+        return presigned.url().toString();
+    }
+
+    @Override
+    public String presignedPutUrl(String key, Duration ttl, String contentType) {
+        PutObjectRequest request = PutObjectRequest.builder()
+                .bucket(bucket())
+                .key(key)
+                .contentType(contentType)
+                .build();
+        PresignedPutObjectRequest presigned = presigner.presignPutObject(builder -> builder
+                .signatureDuration(ttl)
+                .putObjectRequest(request));
+        return presigned.url().toString();
     }
 
     private String bucket() {

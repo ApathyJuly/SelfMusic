@@ -40,6 +40,8 @@ public class AppProperties {
     @Data
     public static class S3 {
         private String endpoint = "";
+        /** 客户端可访问的 MinIO/S3 地址，用于生成预签名 URL；为空时回落到 endpoint */
+        private String publicEndpoint = "";
         private String region = "us-east-1";
         private String accessKey = "";
         private String secretKey = "";

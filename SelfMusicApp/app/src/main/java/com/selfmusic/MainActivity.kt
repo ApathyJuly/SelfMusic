@@ -506,14 +506,22 @@ class MusicViewModel(
 
     fun play(song: SongEntity, queue: List<SongEntity>) = viewModelScope.launch {
         val actualQueue = queue.ifEmpty { listOf(song) }
-        val urls = if (song.sourceType == "CLOUD") {
-            runCatching { actualQueue.associate { it.id to serverApi.playUrl(requireNotNull(it.cloudId)) } }
+        val cloudSongs = actualQueue.filter { it.sourceType == "CLOUD" }
+        val remoteUrls = if (cloudSongs.isNotEmpty()) {
+            runCatching { serverApi.playUrls(cloudSongs.mapNotNull { it.cloudId }) }
                 .getOrElse {
                     _cloudMessage.value = it.message ?: "无法获取播放地址"
                     return@launch
                 }
         } else {
-            actualQueue.associate { it.id to it.uri }
+            emptyMap()
+        }
+        val urls = actualQueue.associate { entry ->
+            entry.id to if (entry.sourceType == "CLOUD") {
+                remoteUrls[requireNotNull(entry.cloudId)]
+            } else {
+                entry.uri
+            }
         }
         controller?.run {
             val list = actualQueue.map { entry ->
@@ -1210,14 +1218,7 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
                     text = { Text("注册") }
                 )
             }
-            Text(
-                "服务器：${AppConfig.defaultServerBaseUrl}",
-                Modifier.fillMaxWidth().padding(top = 12.dp),
-                textAlign = if (gate) TextAlign.Center else TextAlign.Start,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            OutlinedTextField(username, { username = it }, Modifier.fillMaxWidth().padding(top = 10.dp), label = { Text("用户名") }, singleLine = true)
+            OutlinedTextField(username, { username = it }, Modifier.fillMaxWidth().padding(top = 18.dp), label = { Text("用户名") }, singleLine = true)
             if (username.isNotBlank() && !username.matches(Regex("[A-Za-z0-9_]{3,32}"))) {
                 Text("用户名需为 3-32 位字母、数字或下划线", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
@@ -1329,13 +1330,13 @@ private fun lyricPreview(raw: String, positionMs: Long): List<LyricPreviewLine> 
         }
     }
     Surface(mod.fillMaxSize(), color = MaterialTheme.colorScheme.surfaceVariant) {
-            Column(Modifier.fillMaxSize()) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
                     Text("个人中心", style = MaterialTheme.typography.headlineSmall)
                 }
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                    Spacer(Modifier.height(6.dp))
+                    Spacer(Modifier.height(10.dp))
                     SectionCard {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
                             Box {

@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.selfmusic.data.cloud.CloudPlaylist
 import com.selfmusic.data.local.SongEntity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -31,7 +32,7 @@ import kotlin.math.abs
  * 说明：
  * - 登录/刷新令牌保存在 [ServerSessionStore]（Keystore 加密）。
  * - Access Token 过期时自动刷新一次并重试。
- * - 云端媒体由后端签发短时 token，播放地址可直接交给 ExoPlayer。
+ * - 云端媒体由后端签发预签名 URL（本地存储用短时 token），播放地址可直接交给 ExoPlayer。
  */
 class ServerApi(context: Context, private val store: ServerSessionStore) {
 
@@ -212,6 +213,96 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
         title: String,
         durationMs: Long
     ): SongEntity = withContext(Dispatchers.IO) {
+        try {
+            // 优先直传 MinIO；本地存储/旧服务不支持预签名时回落到后端 multipart
+            uploadSongDirect(playlistId, audio, lyric, cover, title, durationMs)
+        } catch (exception: DirectUploadUnavailableException) {
+            uploadSongMultipart(playlistId, audio, lyric, cover, title, durationMs)
+        }
+    }
+
+    private suspend fun uploadSongDirect(
+        playlistId: String,
+        audio: Uri,
+        lyric: Uri?,
+        cover: Uri?,
+        title: String,
+        durationMs: Long
+    ): SongEntity {
+        val audioBody = UriRequestBody(audio)
+        val contentType = audioBody.contentType().toString()
+        val fileSize = audioBody.contentLength()
+        if (fileSize <= 0) throw IOException("无法读取音频文件大小")
+
+        val init = JSONObject()
+            .put("filename", displayName(audio, "audio.mp3"))
+            .put("contentType", contentType)
+            .put("fileSize", fileSize)
+            .put("title", title)
+            .put("artist", "")
+            .put("durationMs", durationMs)
+        val direct = try {
+            requestWithAuth(
+                "/api/v1/playlists/${encode(playlistId)}/songs/direct-upload",
+                "POST",
+                jsonBody(init)
+            ).use { response ->
+                ensureSuccess(response)
+                JSONObject(response.body?.string().orEmpty())
+            }
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (exception: Exception) {
+            throw DirectUploadUnavailableException(exception)
+        }
+        val songId = direct.getString("songId")
+        val audioKey = direct.getString("audioKey")
+        val uploadUrl = direct.getString("uploadUrl")
+        val signedContentType = direct.optString("contentType", contentType)
+
+        // 音频字节直接写入 MinIO，不经过 Spring Boot
+        try {
+            client.newCall(
+                Request.Builder()
+                    .url(uploadUrl)
+                    .put(UriRequestBody(audio))
+                    .header("Content-Type", signedContentType)
+                    .build()
+            ).execute().use { response ->
+                ensureSuccess(response)
+            }
+        } catch (exception: CancellationException) {
+            throw exception
+        } catch (exception: Exception) {
+            throw DirectUploadUnavailableException(exception)
+        }
+
+        val complete = JSONObject()
+            .put("playlistId", playlistId)
+            .put("audioKey", audioKey)
+            .put("title", title)
+            .put("artist", "")
+            .put("mimeType", contentType)
+            .put("durationMs", durationMs)
+        val created = requestWithAuth(
+            "/api/v1/songs/${encode(songId)}/direct-upload/complete",
+            "POST",
+            jsonBody(complete)
+        ).use { response ->
+            ensureSuccess(response)
+            parseSong(JSONObject(response.body?.string().orEmpty()))
+        }
+        return if (lyric != null || cover != null) updateSong(created, title, lyric, cover) else created
+    }
+
+    private suspend fun uploadSongMultipart(
+        playlistId: String,
+        audio: Uri,
+        lyric: Uri?,
+        cover: Uri?,
+        title: String,
+        durationMs: Long
+    ): SongEntity {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("audio", displayName(audio, "audio.mp3"), UriRequestBody(audio))
@@ -219,7 +310,7 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
             .addFormDataPart("durationMs", durationMs.toString())
         lyric?.let { body.addFormDataPart("lyric", displayName(it, "lyrics.lrc"), UriRequestBody(it)) }
         cover?.let { body.addFormDataPart("cover", displayName(it, "cover.jpg"), UriRequestBody(it)) }
-        requestWithAuth(
+        return requestWithAuth(
             "/api/v1/playlists/${encode(playlistId)}/songs",
             "POST",
             body.build()
@@ -308,6 +399,20 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
             ensureSuccess(response)
             absoluteUrl(JSONObject(response.body?.string().orEmpty()).getString("url"))
         }
+    }
+
+    suspend fun playUrls(songIds: List<String>): Map<String, String> = withContext(Dispatchers.IO) {
+        songIds.chunked(400).flatMap { batch ->
+            val body = JSONObject().put("songIds", JSONArray(batch))
+            requestWithAuth("/api/v1/songs/play-urls", "POST", jsonBody(body)).use { response ->
+                ensureSuccess(response)
+                val array = JSONArray(response.body?.string().orEmpty())
+                (0 until array.length()).map { index ->
+                    val item = array.getJSONObject(index)
+                    item.getString("songId") to absoluteUrl(item.getString("url"))
+                }
+            }
+        }.toMap()
     }
 
     suspend fun downloadSong(song: SongEntity, destination: Uri) = withContext(Dispatchers.IO) {
@@ -522,3 +627,5 @@ class ServerApi(context: Context, private val store: ServerSessionStore) {
 }
 
 class ServerAuthException(message: String) : IOException(message)
+
+private class DirectUploadUnavailableException(cause: Throwable) : IOException("直接上传不可用", cause)

@@ -2,7 +2,9 @@
 
 SelfMusic 的自建后端：Java 17 + Spring Boot 3.3 + Spring Security + JPA + MySQL 8 / 5.7 + Flyway + S3 兼容对象存储。
 
-Android 只访问这个后端；音频、封面、歌词存入 S3/MinIO，由后端做鉴权并以 HTTP Range 流式转发。S3 不需要对公网开放。
+> **已经部署好了？** 日常的更新、升级、回滚、发版流程看 **[OPS.md](OPS.md)**（含 git 工作流、数据库迁移规则、回滚预案、Android 签名与发版）。
+
+Android 通过后端完成鉴权和元数据操作；播放/上传音频时，后端签发短时预签名 URL，字节直接走 Nginx → MinIO，不再经过 Spring Boot。开发环境使用本地磁盘时仍回落到后端 Range 流式转发。
 
 ## 功能
 
@@ -12,7 +14,8 @@ Android 只访问这个后端；音频、封面、歌词存入 S3/MinIO，由后
 - 歌单创建、重命名、封面上传、排序、删除
 - 歌曲上传（音频 + 歌词 + 封面）、编辑、移动、删除、下载
 - 收藏、歌词文本/速度/偏移保存
-- 播放地址使用短时 HMAC token，支持 ExoPlayer 的 Range 请求
+- 播放地址使用短时预签名 URL，直连 MinIO/Nginx，支持 ExoPlayer 的 Range 请求
+- 音频直传 MinIO（预签名 PUT），支持后端 multipart 作为本地存储/旧服务回落
 - S3 兼容存储（MinIO / 腾讯云 COS / AWS S3）；开发环境可用本地磁盘
 - Flyway 数据库迁移、Actuator 健康检查、Docker Compose 一键部署
 
@@ -103,7 +106,8 @@ mvn test
 | `MEDIA_TOKEN_TTL` | `PT6H` | 播放地址有效期 |
 | `MEDIA_COVER_TTL` | `P7D` | 封面地址有效期 |
 | `STORAGE_TYPE` | `s3` | `s3` 或 `local` |
-| `S3_ENDPOINT` | `http://localhost:9000` | MinIO/COS/S3 地址 |
+| `S3_ENDPOINT` | `http://localhost:9000` | 后端访问 MinIO/COS/S3 的地址 |
+| `S3_PUBLIC_ENDPOINT` | 生产必填 | App 可访问的媒体地址（Nginx/MinIO），预签名 URL 使用它 |
 | `S3_REGION` | `us-east-1` | 区域；COS 填 `ap-guangzhou` 等 |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | `minioadmin` | 对象存储密钥 |
 | `S3_BUCKET` | `selfmusic` | Bucket |
@@ -134,20 +138,23 @@ Authorization: Bearer <accessToken>
 | PATCH | `/api/v1/playlists/order` | 排序：`{"playlistIds":["..."]}` |
 | DELETE | `/api/v1/playlists/{id}` | 删除歌单及其歌曲/对象 |
 | GET | `/api/v1/playlists/{id}/songs` | 歌单内歌曲 |
-| POST | `/api/v1/playlists/{id}/songs` | 上传歌曲，multipart：`audio`、可选 `lyric`/`cover`、`title`、`artist`、`durationMs` |
+| POST | `/api/v1/playlists/{id}/songs` | 上传歌曲（multipart 回落路径） |
+| POST | `/api/v1/playlists/{id}/songs/direct-upload` | 初始化音频直传，返回预签名 PUT URL |
+| POST | `/api/v1/songs/{id}/direct-upload/complete` | 确认直传完成并创建歌曲 |
 | GET | `/api/v1/songs?playlistId=` | 歌曲列表（不传 playlistId 为全部） |
 | PUT | `/api/v1/songs/{id}` | 编辑歌曲，multipart：`title`、可选 `lyric`/`cover` |
 | PATCH | `/api/v1/songs/{id}/move` | 移动：`{"playlistId":"..."}` |
 | PUT | `/api/v1/songs/{id}/favorite` | 收藏：`{"favorite":true}` |
 | PUT | `/api/v1/songs/{id}/lyrics` | 歌词：`{"lyricsText":"...","lyricSpeed":1.0,"lyricsOffsetMs":0}` |
 | DELETE | `/api/v1/songs/{id}` | 删除歌曲及对象 |
-| GET | `/api/v1/songs/{id}/play-url` | 获取播放地址 |
-| GET | `/api/v1/songs/{id}/download-url` | 获取下载地址 |
+| GET | `/api/v1/songs/{id}/play-url` | 获取单首播放地址 |
+| POST | `/api/v1/songs/play-urls` | 批量获取播放地址：`{"songIds":["..."]}` |
+| GET | `/api/v1/songs/{id}/download-url` | 获取下载地址（预签名，带下载文件名） |
 | GET | `/api/v1/media/songs/{id}?token=` | 媒体流（支持 `Range`） |
 | GET | `/api/v1/media/songs/{id}/cover?token=` | 歌曲封面 |
 | GET | `/api/v1/media/playlists/{id}/cover?token=` | 歌单封面 |
 
-`play-url` 返回的是后端相对路径，Android 会自动拼上服务器地址。媒体接口用短时 token 鉴权，所以 ExoPlayer 不需要额外 Header。
+S3/MinIO 模式下，`play-url` 返回预签名绝对 URL，ExoPlayer 直连 Nginx/MinIO，不需要额外 Header；本地磁盘模式仍返回后端的相对流地址，由 Android 拼接服务器地址。批量接口一次最多 500 首，避免逐首串行请求。
 
 ### 示例
 
@@ -186,6 +193,35 @@ users/{userId}/
 
 数据库中只保存 ObjectKey 和元数据，不保存永久 URL。删除歌曲/歌单时会同步删除对象；删除失败只记录日志，不回滚业务数据。
 
+### 直连 MinIO / Nginx
+
+后端只负责签发预签名 URL，音频字节不再经过 Spring Boot：
+
+```text
+播放：App --预签名 GET--> Nginx --> MinIO
+上传：App --预签名 PUT--> Nginx --> MinIO
+```
+
+需要两个地址：
+
+```properties
+# 后端访问 MinIO（Docker 内可用 http://minio:9000）
+S3_ENDPOINT=http://minio:9000
+# App 访问 MinIO 的公开地址（必须指向 Nginx）
+S3_PUBLIC_ENDPOINT=https://media.example.com
+```
+
+Nginx 示例见 [deploy/nginx-media.conf](deploy/nginx-media.conf)，关键点：
+
+- `proxy_pass` 不要重写路径，否则 SigV4 签名会失效
+- `proxy_set_header Host $host` 保留签名时的 Host
+- 播放关闭 `proxy_buffering`
+- 上传关闭 `proxy_request_buffering`
+- `client_max_body_size` 与后端上限一致
+- **不要对私有预签名 URL 开启 `proxy_cache`**；Nginx 不校验签名过期，可能把过期 URL 的对象继续返回。重复播放缓存交给 Android 的 5GB `PlaybackCache`
+
+如果暂时仍使用本地磁盘（`STORAGE_TYPE=local`），后端会自动回落到原来的 Range 流式转发，Android 上传也会回落到 multipart。
+
 ## 数据库
 
 Flyway 迁移位于 `src/main/resources/db/migration`。
@@ -208,11 +244,12 @@ S3_REGION=ap-guangzhou
 S3_ACCESS_KEY=<CAM SecretId>
 S3_SECRET_KEY=<CAM SecretKey>
 S3_BUCKET=<bucket-name-with-appid>
+S3_PUBLIC_ENDPOINT=https://<COS 自定义 CDN 域名>
 S3_PATH_STYLE=false
 S3_CREATE_BUCKET=false
 ```
 
-Bucket 建议保持私有读写。后端会通过 S3 SDK 读写对象，Android 不直接接触 COS 密钥。
+Bucket 建议保持私有读写。后端只负责签发短时预签名 URL，Android 直连 COS/CDN，不接触 SecretKey。COS 的 CORS/CDN 需要允许 GET/PUT；如果使用 CDN，请开启签名校验，不要公开 Bucket。
 
 ## 生产建议
 

@@ -1,3 +1,8 @@
+# 固定 compose 项目名：数据卷名 = <项目名>_mysql_data。
+# 不写这一行的话，项目名会取目录名（SelfMusicServer → selfmusicserver），
+# 以后目录改名或换个路径 clone，Docker 会当成新项目 → 创建新卷 → 数据"消失"。
+name: selfmusicserver
+
 services:
   mysql:
     image: mysql:8.0
@@ -12,8 +17,9 @@ services:
       - --collation-server=utf8mb4_unicode_ci
     ports:
       # 只监听本机回环：本地要用 DBeaver 等图形工具连库，请走 SSH 隧道（见 DEPLOY.md 第 9 步）
+      # 端口可配：宿主 3306 被占用时在 .env 里设 MYSQL_HOST_PORT
       # 完全不想暴露的话删掉下面这一行，改用 docker compose exec mysql 访问
-      - "127.0.0.1:3306:3306"
+      - "127.0.0.1:${MYSQL_HOST_PORT:-13306}:3306"
     environment:
       MYSQL_DATABASE: ${MYSQL_DATABASE:-selfmusic}
       MYSQL_USER: ${MYSQL_USER:-selfmusic}
@@ -90,6 +96,7 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       S3_BUCKET: ${S3_BUCKET:-selfmusic}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT in .env}
       S3_PATH_STYLE: "true"
       S3_CREATE_BUCKET: "true"
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}

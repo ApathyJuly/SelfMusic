@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.startsWith;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.head;
@@ -117,6 +118,14 @@ class MusicFlowIntegrationTest {
                 .andExpect(status().isOk())
                 .andReturn();
         assertThat(headResult.getResponse().getHeader(HttpHeaders.CONTENT_LENGTH)).isEqualTo("64");
+
+        mockMvc.perform(post("/api/v1/songs/play-urls")
+                        .header(HttpHeaders.AUTHORIZATION, bearer(token))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"songIds\":[\"" + songId + "\"]}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].songId").value(songId))
+                .andExpect(jsonPath("$[0].url", startsWith("/api/v1/media/songs/")));
 
         MvcResult fullResult = mockMvc.perform(get(playUrl))
                 .andExpect(status().isOk())

@@ -3,3 +3,7 @@ data/
 .env
 .env.local
 *.log
+# 备份产物、本地覆盖配置、构建加速用配置，都不要入库
+backups/
+docker-compose.override.yml
+settings.xml

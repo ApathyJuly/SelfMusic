@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -9,19 +11,37 @@ val debugServerBaseUrl = providers.gradleProperty("selfmusic.serverBaseUrl.debug
     .orElse("https://127.0.0.1:8080")
     .get()
 val releaseServerBaseUrl = providers.gradleProperty("selfmusic.serverBaseUrl.release")
-    .orElse("https://miwifi-ra80v2-srv.taild2defd.ts.net/SelfMUsicServer")
+    .orElse("https://miwifi-ra80v2-srv.taild2defd.ts.net/")
     .get()
 fun String.asBuildConfigValue() = "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+// release 签名配置从项目根目录的 keystore.properties 读取（该文件不入库，见 .gitignore）
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
+}
 
 android { namespace = "com.selfmusic"; compileSdk = 35; buildToolsVersion = "35.0.0"
     defaultConfig {
         applicationId = "com.selfmusic"; minSdk = 26; targetSdk = 35; versionCode = 1; versionName = "0.1.0"
+    }
+    // 只有存在 keystore.properties 时才启用签名，避免没有密钥的机器上构建失败
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
     buildTypes {
         debug {
             buildConfigField("String", "DEFAULT_SERVER_BASE_URL", debugServerBaseUrl.asBuildConfigValue())
         }
         release {
+            if (keystorePropsFile.exists()) signingConfig = signingConfigs.getByName("release")
             buildConfigField("String", "DEFAULT_SERVER_BASE_URL", releaseServerBaseUrl.asBuildConfigValue())
         }
     }

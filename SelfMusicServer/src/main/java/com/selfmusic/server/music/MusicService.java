@@ -1,11 +1,16 @@
 package com.selfmusic.server.music;
 
+import com.selfmusic.server.api.dto.DirectUploadCompleteRequest;
+import com.selfmusic.server.api.dto.DirectUploadRequest;
+import com.selfmusic.server.api.dto.DirectUploadResponse;
 import com.selfmusic.server.api.dto.LyricsRequest;
 import com.selfmusic.server.api.dto.MediaUrlResponse;
+import com.selfmusic.server.api.dto.PlayUrlItem;
 import com.selfmusic.server.api.dto.PlaylistDto;
 import com.selfmusic.server.api.dto.SongDto;
 import com.selfmusic.server.common.ApiException;
 import com.selfmusic.server.media.MediaUrlService;
+import com.selfmusic.server.storage.StorageMetadata;
 import com.selfmusic.server.storage.StorageService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -15,6 +20,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -31,6 +37,7 @@ import java.util.stream.Collectors;
 public class MusicService {
 
     private static final long MAX_AUDIO_SIZE = 2L * 1024 * 1024 * 1024;
+    private static final Duration DIRECT_UPLOAD_TTL = Duration.ofMinutes(30);
     private static final long MAX_COVER_SIZE = 10L * 1024 * 1024;
     private static final long MAX_LYRIC_SIZE = 2L * 1024 * 1024;
     private static final int MAX_TITLE_LENGTH = 200;
@@ -224,6 +231,87 @@ public class MusicService {
         return toDto(song);
     }
 
+    @Transactional(readOnly = true)
+    public DirectUploadResponse initDirectUpload(String userId, String playlistId, DirectUploadRequest request) {
+        requirePlaylist(playlistId, userId);
+        if (!storage.supportsPresignedUrls()) {
+            throw ApiException.badRequest("direct_upload_unavailable", "当前存储不支持直传，请使用普通上传");
+        }
+        String extension = validateAudio(request.filename(), request.contentType(), request.fileSize());
+        String contentType = audioContentType(request.contentType(), extension);
+        String songId = UUID.randomUUID().toString();
+        String audioKey = songRoot(userId, songId) + "/audio." + extension;
+        String uploadUrl = storage.presignedPutUrl(audioKey, DIRECT_UPLOAD_TTL, contentType);
+        return new DirectUploadResponse(songId, audioKey, uploadUrl, contentType, DIRECT_UPLOAD_TTL.toSeconds());
+    }
+
+    @Transactional
+    public SongDto completeDirectUpload(String userId, String songId, DirectUploadCompleteRequest request) {
+        Playlist playlist = requirePlaylist(request.playlistId(), userId);
+        String expectedPrefix = songRoot(userId, songId) + "/audio.";
+        if (!request.audioKey().startsWith(expectedPrefix) || request.audioKey().contains("..")) {
+            throw ApiException.badRequest("invalid_audio_key", "音频对象路径不合法");
+        }
+        if (songRepository.existsById(songId)) {
+            throw ApiException.conflict("song_exists", "歌曲已存在");
+        }
+        StorageMetadata metadata;
+        try {
+            metadata = storage.head(request.audioKey());
+        } catch (ApiException exception) {
+            throw ApiException.badRequest("upload_incomplete", "音频尚未上传完成");
+        }
+        if (metadata.size() <= 0 || metadata.size() > MAX_AUDIO_SIZE) {
+            throw ApiException.badRequest("invalid_audio", "音频文件为空或超过 2GB");
+        }
+        String extension = extensionOf(request.audioKey(), "mp3");
+        if (!AUDIO_EXTENSIONS.contains(extension)) {
+            throw ApiException.badRequest("invalid_audio", "不支持的音频格式: " + extension);
+        }
+        String contentType = request.mimeType();
+        if (contentType == null || !contentType.startsWith("audio/")) {
+            contentType = metadata.contentType();
+        }
+        if (contentType == null || contentType.isBlank()) {
+            contentType = audioContentType((String) null, extension);
+        }
+        if (!contentType.startsWith("audio/") && !"application/octet-stream".equals(contentType)) {
+            throw ApiException.badRequest("invalid_audio", "音频 Content-Type 不合法");
+        }
+
+        String title = request.title() == null || request.title().isBlank()
+                ? "未命名歌曲"
+                : request.title().trim();
+        if (title.length() > MAX_TITLE_LENGTH) {
+            title = title.substring(0, MAX_TITLE_LENGTH);
+        }
+        String artist = request.artist() == null || request.artist().isBlank()
+                ? "未知艺术家"
+                : request.artist().trim();
+        if (artist.length() > 200) {
+            artist = artist.substring(0, 200);
+        }
+
+        Song song = new Song();
+        song.setId(songId);
+        song.setUserId(userId);
+        song.setPlaylistId(playlist.getId());
+        song.setTitle(title);
+        song.setArtist(artist);
+        song.setAlbum(playlist.getName());
+        song.setDurationMs(Math.max(0, request.durationMs()));
+        song.setMimeType(contentType);
+        song.setFileSize(metadata.size());
+        song.setAudioObjectKey(request.audioKey());
+        Instant now = Instant.now();
+        song.setObjectVersion(Long.toString(now.toEpochMilli()));
+        song.setSortOrder(songRepository.findMaxSortOrder(playlist.getId()) + 1);
+        song.setCreatedAt(now);
+        song.setUpdatedAt(now);
+        songRepository.save(song);
+        return toDto(song);
+    }
+
     @Transactional
     public SongDto updateSong(
             String userId,
@@ -324,9 +412,23 @@ public class MusicService {
 
     @Transactional(readOnly = true)
     public MediaUrlResponse playUrl(String userId, String songId, boolean download) {
-        requireSong(songId, userId);
-        String url = mediaUrlService.songStreamUrl(songId, userId, download);
+        Song song = requireSong(songId, userId);
+        String url = mediaUrlService.songStreamUrl(song, download);
         return new MediaUrlResponse(url, mediaUrlService.audioTtlSeconds());
+    }
+
+    @Transactional(readOnly = true)
+    public List<PlayUrlItem> playUrls(String userId, List<String> songIds) {
+        List<String> ids = songIds.stream().filter(id -> id != null && !id.isBlank()).distinct().toList();
+        Map<String, Song> byId = songRepository.findAllById(ids).stream()
+                .filter(song -> userId.equals(song.getUserId()))
+                .collect(Collectors.toMap(Song::getId, song -> song));
+        if (byId.size() != ids.size()) {
+            throw ApiException.notFound("歌曲不存在");
+        }
+        return ids.stream()
+                .map(id -> new PlayUrlItem(id, mediaUrlService.songStreamUrl(byId.get(id), false)))
+                .toList();
     }
 
     @Transactional(readOnly = true)
@@ -344,7 +446,7 @@ public class MusicService {
     public SongDto toDto(Song song) {
         String coverUrl = song.getCoverObjectKey() == null
                 ? null
-                : mediaUrlService.songCoverUrl(song.getId(), song.getUserId());
+                : mediaUrlService.songCoverUrl(song);
         return new SongDto(
                 song.getId(),
                 song.getPlaylistId(),
@@ -368,7 +470,7 @@ public class MusicService {
     private PlaylistDto toDto(Playlist playlist, long songCount) {
         String coverUrl = playlist.getCoverObjectKey() == null
                 ? null
-                : mediaUrlService.playlistCoverUrl(playlist.getId(), playlist.getUserId());
+                : mediaUrlService.playlistCoverUrl(playlist);
         return new PlaylistDto(
                 playlist.getId(),
                 playlist.getName(),
@@ -417,15 +519,20 @@ public class MusicService {
     }
 
     private static String validateAudio(MultipartFile file) {
-        if (file.getSize() <= 0 || file.getSize() > MAX_AUDIO_SIZE) {
+        return validateAudio(file.getOriginalFilename(), file.getContentType(), file.getSize());
+    }
+
+    private static String validateAudio(String filename, String contentType, long size) {
+        if (size <= 0 || size > MAX_AUDIO_SIZE) {
             throw ApiException.badRequest("invalid_audio", "音频文件为空或超过 2GB");
         }
-        String extension = extensionOf(file.getOriginalFilename(), "mp3");
+        String extension = extensionOf(filename, "mp3");
         if (!AUDIO_EXTENSIONS.contains(extension)) {
             throw ApiException.badRequest("invalid_audio", "不支持的音频格式: " + extension);
         }
-        String type = file.getContentType();
-        if (type != null && !type.isBlank() && !type.startsWith("audio/") && !"application/octet-stream".equals(type)) {
+        if (contentType != null && !contentType.isBlank()
+                && !contentType.startsWith("audio/")
+                && !"application/octet-stream".equals(contentType)) {
             throw ApiException.badRequest("invalid_audio", "音频 Content-Type 不合法");
         }
         return extension;
@@ -467,7 +574,10 @@ public class MusicService {
     }
 
     private static String audioContentType(MultipartFile file, String extension) {
-        String type = file.getContentType();
+        return audioContentType(file.getContentType(), extension);
+    }
+
+    private static String audioContentType(String type, String extension) {
         if (type != null && type.startsWith("audio/")) {
             return type;
         }

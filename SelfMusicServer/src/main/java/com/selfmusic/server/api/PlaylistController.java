@@ -1,5 +1,7 @@
 package com.selfmusic.server.api;
 
+import com.selfmusic.server.api.dto.DirectUploadRequest;
+import com.selfmusic.server.api.dto.DirectUploadResponse;
 import com.selfmusic.server.api.dto.PlaylistDto;
 import com.selfmusic.server.api.dto.ReorderRequest;
 import com.selfmusic.server.api.dto.SongDto;
@@ -82,6 +84,15 @@ public class PlaylistController {
             @PathVariable String playlistId
     ) {
         return musicService.listSongs(principal.id(), playlistId);
+    }
+
+    @PostMapping(value = "/{playlistId}/songs/direct-upload", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public DirectUploadResponse initDirectUpload(
+            @AuthenticationPrincipal UserPrincipal principal,
+            @PathVariable String playlistId,
+            @Valid @RequestBody DirectUploadRequest request
+    ) {
+        return musicService.initDirectUpload(principal.id(), playlistId, request);
     }
 
     @PostMapping(value = "/{playlistId}/songs", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

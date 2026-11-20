@@ -5,6 +5,7 @@ local.properties
 !.env.example
 *.jks
 *.keystore
+keystore.properties
 
 # Build and IDE output
 .gradle/

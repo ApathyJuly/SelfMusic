@@ -10,14 +10,14 @@
 | 项目 | 值 | 备注 |
 |---|---|---|
 | 服务器 | CentOS 7.9，`192.168.31.69`，用户 `dell` | Docker 26.1.4 |
-| 服务端目录 | `/opt/SelfMusicServer` | 建议后续改成 git 仓库（第 1 节） |
+| 服务端目录 | `/opt/SelfMusicServer/SelfMusicServer` | **注意是嵌套两层**：仓库根 = 项目根，`SelfMusicApp/` 和 `SelfMusicServer/` 都在下面；`docker-compose.yml`、`.env`、`deploy.sh` 都在这个内层目录 |
 | 容器 | `selfmusicserver-mysql-1` / `-minio-1` / `-server-1` | `minio-init` 跑完即退出，正常 |
 | Compose 项目名 | `selfmusicserver`（已固定在 compose 里） | 数据卷名 `selfmusicserver_mysql_data`、`selfmusicserver_miniodata` |
 | 后端监听 | `127.0.0.1:8080` | 不对外，所有外部访问都经过反代 |
 | MySQL | 容器内 3306，宿主映射 `127.0.0.1:13306` | 宿主 3306 已被你自己的 MySQL 占用 |
-| MinIO | `127.0.0.1:9000`，控制台 `127.0.0.1:9001` | 不对外 |
-| 公网入口 | `https://miwifi-ra80v2-srv.taild2defd.ts.net/` | Tailscale Funnel → 8080，证书自动续期 |
-| 密钥 | `/opt/SelfMusicServer/.env`（600） | 另存一份 `~/passwords.txt` |
+| MinIO | `127.0.0.1:9000`，控制台 `127.0.0.1:9001` | 本机不对外，但通过 Funnel 8443 公开（预签名媒体需要） |
+| 公网入口 | `https://miwifi-ra80v2-srv.taild2defd.ts.net/` → 8080（API）<br>`https://miwifi-ra80v2-srv.taild2defd.ts.net:8443/` → 9000（MinIO 媒体） | Tailscale Funnel，证书自动续期。媒体走预签名直连，不再经后端 |
+| 密钥 | `/opt/SelfMusicServer/SelfMusicServer/.env`（600） | 另存一份 `~/passwords.txt` |
 | Android 服务端地址 | `SelfMusicApp/gradle.properties` 的 `selfmusic.serverBaseUrl.release` | 改完要重新打包 |
 
 **三条铁律：**
@@ -127,22 +127,33 @@ rm -rf /opt/SelfMusicServer.old
 
 ### 1.4 配部署密钥（免密 pull）
 
-否则每次 `git pull` 都要输密码，`deploy.sh update` 会卡住。
+否则每次 `git pull` 都会失败在鉴权上（`Permission denied (publickey)`），`upgrade.sh` 也会卡住。
 
 ```bash
-# 在服务器上，以 dell 用户
-ssh-keygen -t ed25519 -C "selfmusic-server" -f ~/.ssh/id_ed25519 -N ""
-cat ~/.ssh/id_ed25519.pub
+# 在服务器上，以 root 身份（clone 在 /opt 下，属主是 root）
+ssh-keygen -t ed25519 -C "selfmusic-server" -f /root/.ssh/id_ed25519 -N ""
+cat /root/.ssh/id_ed25519.pub
 ```
 
-把公钥贴到 Gitee：仓库 → **管理** → **部署公钥管理** → 添加部署公钥（只读即可）。
+把公钥贴到 **GitHub**：仓库 → **Settings** → **Deploy keys** → Add deploy key（**Allow write access 不要勾**）。
+
+> 用 Gitee 的话路径是：仓库 → 管理 → 部署公钥管理 → 添加（同样只读）。
 
 验证：
 
 ```bash
-ssh -T git@gitee.com     # 看到 "Hi ... You've successfully authenticated" 就成了
+ssh -T git@github.com     # 看到 "Hi 用户名/仓库! You've successfully authenticated" 就成了
 cd /opt/SelfMusicServer && git pull
 ```
+
+> 国内服务器直连 `github.com:22` 常常超时。如果 `ssh -T` 卡住，在 `/root/.ssh/config` 里加：
+> ```
+> Host github.com
+>   HostName ssh.github.com
+>   Port 443
+>   User git
+> ```
+> 再 `chmod 600 /root/.ssh/config` 即可（改走 443 端口）。
 
 ---
 
@@ -159,22 +170,42 @@ cd /opt/SelfMusicServer && git pull
 | 新增 Flyway 迁移 `V2__xxx.sql` | 同「改 Java 代码」，启动时自动执行 | 同上 |
 | 改前端/Android | 不在服务器重建，见第 5 节 | — |
 
-### 2.2 标准升级五步
+### 2.2 标准升级：一条命令
 
 ```bash
-cd /opt/SelfMusicServer
+cd /opt/SelfMusicServer/SelfMusicServer
+./deploy/upgrade.sh
+```
 
-# ① 备份（每次都要，别省）
+`deploy/upgrade.sh` 会依次做：
+
+1. 打印当前版本（commit）
+2. **备份** MySQL + MinIO（失败立即中止，不会带着没备份的状态继续）
+3. `git fetch` + `git pull --ff-only`（有分叉直接报错，不静默合并），并列出本次更新了哪些提交
+4. 后台 `docker compose up -d --build`（SSH 掉线不会中断构建）
+5. 轮询 `actuator/health`，最多等 3 分钟
+6. 成功则打印 `docker compose ps` 和收尾提醒；失败则打印日志末尾并提示回滚位置
+
+日志：`/tmp/upgrade-时间戳.log`
+
+**如果脚本报「不是 git 仓库」**：说明目录不对，你现在在外层（`/opt/SelfMusicServer`），要进内层 `SelfMusicServer/SelfMusicServer`。
+
+### 2.3 手动升级（脚本出问题时的等价操作）
+
+```bash
+cd /opt/SelfMusicServer/SelfMusicServer
+
+# ① 备份
 ./deploy.sh backup
 
-# ② 看将要拉下来的改动，确认没有意外
+# ② 看将要拉下来的改动
 git fetch
 git log --oneline HEAD..origin/main
 
-# ③ 拉取（--ff-only 避免产生 merge 提交，冲突会直接报错而不是静默合并）
+# ③ 拉取
 git pull --ff-only
 
-# ④ 重建并启动（后台跑，防掉线）
+# ④ 重建（后台，防掉线）
 nohup docker compose up -d --build > /tmp/build.log 2>&1 &
 tail -f /tmp/build.log
 
@@ -184,19 +215,30 @@ curl -s 127.0.0.1:8080/actuator/health
 docker compose logs --tail=50 server
 ```
 
+**成功的标志**：三个服务 `Up`（mysql 显示 `healthy`）、`curl` 返回 `{"status":"UP"}`、日志里出现 `Started SelfMusicApplication`。
+
+**然后必须做的功能验证**（health 只代表进程活着）：
+
+```bash
+# 媒体入口（MinIO 公网）
+curl -I https://miwifi-ra80v2-srv.taild2defd.ts.net:8443/minio/health/live
+```
+
+再用手机 App 实际**传一首歌 + 播放一次** —— 媒体链路走的是预签名 URL 直连 MinIO，跟后端 health 无关，必须单独验。
+
 **成功的标志**：`docker compose ps` 三个服务 `Up`、`curl` 返回 `{"status":"UP"}`、日志里出现 `Started SelfMusicApplication`。
 
-### 2.3 关于构建耗时和缓存
+### 2.4 关于构建耗时和缓存
 
-第一次构建花了 32 分钟（`mvn dependency:go-offline` 下依赖）。之后的构建会复用 Docker 层缓存：
+实测：首次构建 32 分钟（`mvn dependency:go-offline` 下依赖），`pom.xml` 变更后的构建同样要重下依赖。之后的构建会复用 Docker 层缓存：
 
 - 只改 `src/` → `COPY src` 之后的层失效，但 **依赖层命中缓存** → 1～3 分钟
 - 改 `pom.xml` → 依赖层失效，重新下载 → 10～30 分钟
 
-如果嫌慢，加阿里云 Maven 镜像（一次性配置）：
+如果嫌慢，加阿里云 Maven 镜像（一次性配置，`settings.xml` 不入库）：
 
 ```bash
-cd /opt/SelfMusicServer
+cd /opt/SelfMusicServer/SelfMusicServer
 
 cat > settings.xml <<'EOF'
 <settings>
